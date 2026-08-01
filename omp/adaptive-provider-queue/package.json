@@ -1,0 +1,45 @@
+{
+  "name": "omp-adaptive-provider-queue",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Adaptive cross-process queue for transient provider concurrency limits in Oh My Pi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/izumi0uu/pi-omp-plugin-bundle.git",
+    "directory": "omp/adaptive-provider-queue"
+  },
+  "homepage": "https://github.com/izumi0uu/pi-omp-plugin-bundle/tree/main/omp/adaptive-provider-queue#readme",
+  "bugs": {
+    "url": "https://github.com/izumi0uu/pi-omp-plugin-bundle/issues"
+  },
+  "type": "module",
+  "files": [
+    "src",
+    "test",
+    "scripts",
+    "examples",
+    ".env.example",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "omp-plugin",
+    "oh-my-pi",
+    "provider",
+    "rate-limit",
+    "queue"
+  ],
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "pack:check": "node scripts/pack-check.mjs"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "license": "UNLICENSED"
+}

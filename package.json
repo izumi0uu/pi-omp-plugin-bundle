@@ -1,0 +1,46 @@
+{
+  "name": "pi-omp-plugin-bundle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Pi and Oh My Pi plugin bundle",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/izumi0uu/pi-omp-plugin-bundle.git"
+  },
+  "homepage": "https://github.com/izumi0uu/pi-omp-plugin-bundle#readme",
+  "bugs": {
+    "url": "https://github.com/izumi0uu/pi-omp-plugin-bundle/issues"
+  },
+  "type": "module",
+  "files": [
+    "pi",
+    "omp",
+    "README.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
+  ],
+  "keywords": [
+    "pi-package",
+    "omp-plugin",
+    "oh-my-pi"
+  ],
+  "workspaces": [
+    "pi/*",
+    "omp/*"
+  ],
+  "omp": {
+    "extensions": [
+      "./omp/adaptive-provider-queue/src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "npm --prefix omp/adaptive-provider-queue test",
+    "pack:check": "npm --prefix omp/adaptive-provider-queue run pack:check",
+    "bundle:pack:check": "node omp/adaptive-provider-queue/scripts/pack-check.mjs",
+    "check": "npm run test && npm run pack:check && npm run bundle:pack:check"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "license": "UNLICENSED"
+}

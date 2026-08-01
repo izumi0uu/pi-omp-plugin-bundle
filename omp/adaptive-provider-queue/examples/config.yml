@@ -1,0 +1,9 @@
+modelRoles:
+  default: aiinput-queued/gpt-5.6-sol:max
+  research: tokenking-grok-queued/grok-4.5:high
+
+retry:
+  modelFallback: true
+  fallbackChains:
+    tokenking-grok-queued/*:
+      - aiinput-queued/gpt-5.6-sol:max
