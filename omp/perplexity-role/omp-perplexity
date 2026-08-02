@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+: "${HOME:?HOME must be set}"
+
+omp_agent_dir=${PI_CODING_AGENT_DIR:-"$HOME/.omp/agent"}
+perplexity_dir=${OMP_PERPLEXITY_DIR:-"$omp_agent_dir/perplexity-role"}
+perplexity_sessions=${OMP_PERPLEXITY_SESSION_DIR:-"$omp_agent_dir/sessions/perplexity-role"}
+
+exec omp \
+  --config "$perplexity_dir/config.yml" \
+  --cwd "$perplexity_dir" \
+  --model "@perplexity" \
+  --system-prompt "$perplexity_dir/system-prompt.md" \
+  --tools web_search \
+  --no-rules \
+  --no-skills \
+  --session-dir "$perplexity_sessions" \
+  "$@"

@@ -1,0 +1,5 @@
+modelRoles:
+  perplexity: tokenking-grok-queued/grok-4.5:high
+providers:
+  webSearchOrder:
+    - perplexity

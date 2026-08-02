@@ -7,7 +7,8 @@ pi-omp-plugin-bundle/
 ├── pi/                         # Pi 原生插件
 └── omp/                        # OMP 原生插件
     ├── adaptive-provider-queue/
-    └── pi-tool-display/
+    ├── pi-tool-display/
+    └── perplexity-role/
 ```
 
 ## 当前插件
@@ -16,6 +17,7 @@ pi-omp-plugin-bundle/
 |---|---|---|
 | OMP 17.2.2 | `adaptive-provider-queue` | Locally verified; newer versions unverified |
 | OMP 17.2.x | `omp-pi-tool-display` | Ported from upstream `v0.5.0`; pure tests and isolated OMP 17.2.4 load verified |
+| OMP Role | `perplexity` | Dedicated main-agent window using Perplexity-first `web_search` |
 | Pi | - | Reserved for native Pi ports |
 
 ## 开发与验证
@@ -24,7 +26,7 @@ pi-omp-plugin-bundle/
 npm run check
 ```
 
-选择一个安装目标：bundle 根目录，或单独的某个 OMP 子包。根目录会加载两个 OMP 插件；不要把根目录和任一子包同时安装，否则会重复注册对应入口。
+选择一个安装目标：bundle 根目录，或单独的某个 OMP 子包。根目录会加载全部 OMP 插件；不要把根目录和任一子包同时安装，否则会重复注册对应入口。
 
 开发时可以链接整个 bundle；OMP 会读取根 manifest 中列出的所有 OMP 扩展：
 
@@ -60,6 +62,17 @@ omp plugin install github:izumi0uu/pi-omp-plugin-bundle#COMMIT_OR_TAG
 ```
 
 同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 provider 或工具。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
+
+`perplexity` 是窗口专用的 model role，不是插件或 task agent。安装配置和启动器后直接打开搜索窗口：
+
+```bash
+install -d ~/.omp/agent/perplexity-role ~/.local/bin
+install -m 0644 omp/perplexity-role/config.yml omp/perplexity-role/system-prompt.md ~/.omp/agent/perplexity-role/
+install -m 0755 omp/perplexity-role/omp-perplexity ~/.local/bin/omp-perplexity
+omp-perplexity
+```
+
+该窗口的主 Agent 直接调用 Perplexity-first 搜索，只开放 `web_search` 工具，并把会话保存到独立的 session 目录。如果 OMP 在 OAuth 故障时使用了 fallback，回答会明确披露。详见 [`omp/perplexity-role/README.md`](omp/perplexity-role/README.md)。
 
 ## 发布边界
 
