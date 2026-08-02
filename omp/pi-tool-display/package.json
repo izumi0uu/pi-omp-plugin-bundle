@@ -1,0 +1,41 @@
+{
+  "name": "omp-pi-tool-display",
+  "version": "0.5.0-omp.1",
+  "private": true,
+  "description": "OMP-native port of pi-tool-display with conservative tool ownership defaults",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "tool-display-api-consumer.js",
+    "tool-display-api-consumer.d.ts",
+    "src",
+    "test",
+    "config/config.example.json",
+    "README.md",
+    "UPSTREAM_README.md",
+    "UPSTREAM_CHANGELOG.md",
+    "LICENSE"
+  ],
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "pack:check": "node ../adaptive-provider-queue/scripts/pack-check.mjs"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/izumi0uu/pi-omp-plugin-bundle.git",
+    "directory": "omp/pi-tool-display"
+  },
+  "homepage": "https://github.com/izumi0uu/pi-omp-plugin-bundle/tree/main/omp/pi-tool-display#readme",
+  "bugs": {
+    "url": "https://github.com/izumi0uu/pi-omp-plugin-bundle/issues"
+  }
+}

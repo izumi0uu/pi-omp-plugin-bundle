@@ -6,7 +6,8 @@
 pi-omp-plugin-bundle/
 ├── pi/                         # Pi 原生插件
 └── omp/                        # OMP 原生插件
-    └── adaptive-provider-queue/
+    ├── adaptive-provider-queue/
+    └── pi-tool-display/
 ```
 
 ## 当前插件
@@ -14,6 +15,7 @@ pi-omp-plugin-bundle/
 | Runtime | Plugin | Status |
 |---|---|---|
 | OMP 17.2.2 | `adaptive-provider-queue` | Locally verified; newer versions unverified |
+| OMP 17.2.x | `omp-pi-tool-display` | Ported from upstream `v0.5.0`; pure tests and isolated OMP 17.2.4 load verified |
 | Pi | - | Reserved for native Pi ports |
 
 ## 开发与验证
@@ -22,7 +24,7 @@ pi-omp-plugin-bundle/
 npm run check
 ```
 
-选择一个安装目标：bundle 根目录，或单独的 `./omp/adaptive-provider-queue` 子包。不要同时安装两者；它们是不同的插件身份，但会加载同一个入口并重复注册 provider。
+选择一个安装目标：bundle 根目录，或单独的某个 OMP 子包。根目录会加载两个 OMP 插件；不要把根目录和任一子包同时安装，否则会重复注册对应入口。
 
 开发时可以链接整个 bundle；OMP 会读取根 manifest 中列出的所有 OMP 扩展：
 
@@ -36,14 +38,17 @@ omp plugin link .
 omp plugin install .
 ```
 
-在 OMP 17.2.2 中，这两条本地路径命令都会创建 symlink；移动或删除 checkout 会使插件失效。只开发当前插件时，也可以把 `./omp/adaptive-provider-queue` 作为安装目标，但切换前应先卸载原来的 bundle 或子包。
+在 OMP 17.2.2 中，这两条本地路径命令都会创建 symlink；移动或删除 checkout 会使插件失效。只开发当前插件时，也可以把某一个子目录作为安装目标，但切换前应先卸载原来的 bundle 或子包。
 
 ```bash
 # 切换到子包安装前
 omp plugin uninstall pi-omp-plugin-bundle
 
-# 切回 bundle 根安装前
+# 切换 adaptive-provider-queue 子包前
 omp plugin uninstall omp-adaptive-provider-queue
+
+# 切换 omp-pi-tool-display 子包前
+omp plugin uninstall omp-pi-tool-display
 ```
 
 如需只预览操作，使用 `omp plugin install PATH --dry-run`。OMP 17.2.2 的 `omp plugin link PATH --dry-run` 仍会实际创建链接。
@@ -54,11 +59,11 @@ omp plugin uninstall omp-adaptive-provider-queue
 omp plugin install github:izumi0uu/pi-omp-plugin-bundle#COMMIT_OR_TAG
 ```
 
-同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 provider。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md)。
+同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 provider 或工具。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
 
 ## 发布边界
 
-仓库和子包当前均标记为 `private` / `UNLICENSED`，用于个人 Git 仓库和本地/Git 安装，并阻止误发布到 npm。公开分发前需要明确许可证、移除 `private`，再补充稳定的仓库 URL 和版本发布流程。
+bundle 根包和 `adaptive-provider-queue` 当前标记为 `private` / `UNLICENSED`，用于个人 Git 仓库和本地/Git 安装，并阻止误发布到 npm；`omp-pi-tool-display` 保留上游 MIT 许可证。公开分发其他插件前仍需明确许可证、移除对应的 `private`，再补充稳定的版本发布流程。
 
 ## Security
 

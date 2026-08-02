@@ -30,12 +30,13 @@
   ],
   "omp": {
     "extensions": [
-      "./omp/adaptive-provider-queue/src/index.ts"
+      "./omp/adaptive-provider-queue/src/index.ts",
+      "./omp/pi-tool-display/index.ts"
     ]
   },
   "scripts": {
-    "test": "npm --prefix omp/adaptive-provider-queue test",
-    "pack:check": "npm --prefix omp/adaptive-provider-queue run pack:check",
+    "test": "npm --prefix omp/adaptive-provider-queue test && npm --prefix omp/pi-tool-display test",
+    "pack:check": "npm --prefix omp/adaptive-provider-queue run pack:check && npm --prefix omp/pi-tool-display run pack:check",
     "bundle:pack:check": "node omp/adaptive-provider-queue/scripts/pack-check.mjs",
     "check": "npm run test && npm run pack:check && npm run bundle:pack:check"
   },

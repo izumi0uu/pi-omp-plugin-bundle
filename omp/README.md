@@ -5,3 +5,4 @@
 | Plugin | Purpose |
 |---|---|
 | [`adaptive-provider-queue`](adaptive-provider-queue/) | 遇到瞬时并发限流后启用跨进程 FIFO 排队；其他不可用错误继续交给 OMP fallback |
+| [`pi-tool-display`](pi-tool-display/) | OMP-native compact tool output, diff rendering, thinking labels, and the `/tool-display` settings command |
