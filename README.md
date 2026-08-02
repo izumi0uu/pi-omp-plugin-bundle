@@ -72,7 +72,7 @@ install -m 0755 omp/perplexity-role/omp-perplexity ~/.local/bin/omp-perplexity
 omp-perplexity
 ```
 
-该窗口的主 Agent 直接调用 Perplexity-first 搜索，只开放 `web_search` 工具，并把会话保存到独立的 session 目录。实际 provider 和 OAuth 状态需在展开的 `web_search` 工具卡片中查看；OMP 17.2.4 不会把该元数据传给回答模型。详见 [`omp/perplexity-role/README.md`](omp/perplexity-role/README.md)。
+该窗口的主 Agent 直接调用 Perplexity-first 搜索，只开放 `web_search` 工具，并把会话保存到独立的 session 目录。OMP 17.2.4 要求同名 role 同时登记在全局 `modelRoles` 中才会显示于 `/model`；只有启动 overlay 时仍能解析模型，但 UI 不展示。实际 provider 和 OAuth 状态需在展开的 `web_search` 工具卡片中查看。详见 [`omp/perplexity-role/README.md`](omp/perplexity-role/README.md)。
 
 ## 发布边界
 

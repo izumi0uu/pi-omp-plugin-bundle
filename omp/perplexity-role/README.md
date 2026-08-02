@@ -20,6 +20,17 @@ Start the dedicated window:
 omp-perplexity
 ```
 
+### Role visibility in OMP 17.2.4
+
+The launch overlay can resolve `@perplexity`, but the `/model` Roles editor only lists roles persisted in the global `~/.omp/agent/config.yml`. To make the row visible, merge this entry into the existing global `modelRoles` mapping without replacing its other entries:
+
+```yaml
+modelRoles:
+  perplexity: tokenking-grok-queued/grok-4.5:high
+```
+
+The global entry only exposes the model alias. Perplexity-first search routing, the search prompt, tool restriction, and session isolation still come from the `omp-perplexity` launcher; merely selecting this role in an ordinary OMP window does not enable those behaviors.
+
 Arguments pass through to OMP, including session operations:
 
 ```bash
