@@ -72,7 +72,7 @@ install -m 0755 omp/perplexity-role/omp-perplexity ~/.local/bin/omp-perplexity
 omp-perplexity
 ```
 
-该窗口的主 Agent 直接调用 Perplexity-first 搜索，只开放 `web_search` 工具，并把会话保存到独立的 session 目录。如果 OMP 在 OAuth 故障时使用了 fallback，回答会明确披露。详见 [`omp/perplexity-role/README.md`](omp/perplexity-role/README.md)。
+该窗口的主 Agent 直接调用 Perplexity-first 搜索，只开放 `web_search` 工具，并把会话保存到独立的 session 目录。实际 provider 和 OAuth 状态需在展开的 `web_search` 工具卡片中查看；OMP 17.2.4 不会把该元数据传给回答模型。详见 [`omp/perplexity-role/README.md`](omp/perplexity-role/README.md)。
 
 ## 发布边界
 

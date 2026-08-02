@@ -2,7 +2,9 @@
 
 This is a dedicated OMP main-agent window for everyday search. It is a model-role overlay and launcher, not a plugin or task agent.
 
-The window uses the `perplexity` model role for answer synthesis and prioritizes authenticated Perplexity for OMP's built-in `web_search` tool. Only `web_search` is enabled, and the launcher uses an isolated working directory, so the window cannot modify a project or run commands. If OMP falls back from Perplexity OAuth, the search prompt requires the answer to disclose that fact.
+The window uses the `perplexity` model role for answer synthesis and prioritizes Perplexity for OMP's built-in `web_search` tool. Only `web_search` is enabled, and the launcher uses an isolated working directory, so the window cannot modify a project or run commands.
+
+Expand the `web_search` tool card to verify the actual provider and authentication mode. OMP 17.2.4 shows that metadata in the UI but does not pass it to the answer model, so final prose cannot reliably prove that OAuth was used. Strict OAuth-only routing would require a custom provider wrapper and is intentionally outside this simple role.
 
 ## Install
 
