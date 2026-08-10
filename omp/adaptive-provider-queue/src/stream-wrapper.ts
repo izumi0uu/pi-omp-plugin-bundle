@@ -1,4 +1,4 @@
-import { AdaptiveProviderQueue, createLaneId, sleepWithSignal, type QueueTicket } from "./queue.ts";
+import { AdaptiveProviderQueue, createLaneId, type QueueTicket, type RetryWindowDecision } from "./queue.ts";
 
 interface AssistantLike {
 	stopReason?: string;
@@ -39,6 +39,19 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 }
 
 export const DEFAULT_MAX_RETRIES = 50;
+
+export class AdaptiveRetryExhaustedError extends Error {
+	readonly code = "ADAPTIVE_RETRY_EXHAUSTED";
+	readonly attempt: number;
+	readonly maxRetries: number;
+
+	constructor(attempt: number, maxRetries: number) {
+		super(`Adaptive provider recovery budget exhausted (${attempt}/${maxRetries}); fallback required`);
+		this.name = "AdaptiveRetryExhaustedError";
+		this.attempt = attempt;
+		this.maxRetries = maxRetries;
+	}
+}
 
 const QUOTA_OR_BILLING_PATTERN =
 	/insufficient[_ -]?quota|quota (?:exceeded|exhausted)|resource[_ -]?exhausted|usage[_ -]?limit[_ -]?reached|billing|credit|balance|spend(?:ing)?[_ -]?limit|monthly[_ -]?limit|daily[_ -]?limit/i;
@@ -140,6 +153,13 @@ function isSubstantiveOutputEvent(event: StreamEventLike): boolean {
 	return true;
 }
 
+function isCancellation(error: unknown, signal?: AbortSignal): boolean {
+	if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) return true;
+	if (!error || typeof error !== "object") return false;
+	const candidate = error as Record<string, unknown>;
+	return candidate.stopReason === "aborted" || candidate.reason === "aborted";
+}
+
 export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: AdaptiveStreamOptions<TOutput>): TOutput {
 	const output = options.createOutputStream();
 	const signal = options.requestOptions?.signal;
@@ -152,23 +172,45 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 
 	void (async () => {
 		let ticket: QueueTicket | undefined;
-		let retryAttempt = 0;
+		let replayCount = 0;
 		let emittedStart = false;
 		let emittedTextStart = false;
 		let emittedThinking = false;
 		try {
-			if (await options.queue.hasWaiters(laneId)) {
+			const [hasWaiters, hasRetryState] = await Promise.all([
+				options.queue.hasWaiters(laneId),
+				options.queue.hasRetryState(laneId),
+			]);
+			if (hasWaiters || hasRetryState) {
 				ticket = await options.queue.acquire(laneId);
 			}
 
+			const waitForFrontRetryWindow = async (): Promise<RetryWindowDecision> => {
+				if (!ticket) return { status: "ready", claimed: false };
+				const queueDepth = await options.queue.waitForTurn(ticket, signal);
+				options.logger?.info?.("adaptive provider queue request reached front", {
+					provider: options.model.provider,
+					model: options.model.id,
+					queueDepth,
+				});
+				return options.queue.waitForRetryWindow(ticket, signal);
+			};
+
+			const retryExhaustedError = (window: Extract<RetryWindowDecision, { status: "exhausted" }>) =>
+				new AdaptiveRetryExhaustedError(window.state.attempt, window.state.maxRetries);
+
 			while (!output.done) {
 				if (ticket) {
-					const queueDepth = await options.queue.waitForTurn(ticket, signal);
-					options.logger?.info?.("adaptive provider queue request reached front", {
-						provider: options.model.provider,
-						model: options.model.id,
-						queueDepth,
-					});
+					const window = await waitForFrontRetryWindow();
+					if (window.status === "exhausted") {
+						options.logger?.warn?.("adaptive provider queue shared retry budget is exhausted", {
+							provider: options.model.provider,
+							model: options.model.id,
+							attempt: window.state.attempt,
+							maxRetries: window.state.maxRetries,
+						});
+						throw retryExhaustedError(window);
+					}
 				}
 
 				const replaySafeEvents: StreamEventLike[] = [];
@@ -185,7 +227,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						emittedTextStart = true;
 					}
 					if (isThinkingEvent(event)) {
-						if (retryAttempt > 0 && emittedThinking) return;
+						if (replayCount > 0 && emittedThinking) return;
 						emittedThinking = true;
 					}
 					output.push(event);
@@ -195,30 +237,63 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					replaySafeEvents.length = 0;
 				};
 				const waitForRetry = async (error: unknown, kind: "rate-limit" | "transport"): Promise<boolean> => {
-					const retryNumber = retryAttempt + 1;
-					if (retryNumber > maxRetries) {
+					let joinedBehindAnotherRequest = false;
+					if (!ticket) {
+						ticket = await options.queue.acquire(laneId);
+						joinedBehindAnotherRequest = (await options.queue.position(ticket)) > 0;
+					}
+
+					const currentWindow = await waitForFrontRetryWindow();
+					if (currentWindow.status === "exhausted") {
+						options.logger?.warn?.("adaptive provider queue shared retry budget is exhausted", {
+							provider: options.model.provider,
+							model: options.model.id,
+							kind,
+							attempt: currentWindow.state.attempt,
+							maxRetries: currentWindow.state.maxRetries,
+						});
+						return false;
+					}
+
+					if (currentWindow.claimed || (joinedBehindAnotherRequest && !currentWindow.state)) {
+						replayCount += 1;
+						options.logger?.info?.("adaptive provider queue discarded a stale concurrent failure", {
+							provider: options.model.provider,
+							model: options.model.id,
+							observedRecovery: !currentWindow.state,
+							tookOverProbe: currentWindow.claimed,
+						});
+						return true;
+					}
+
+					const retryAfterMs = retryAfterMsFromError(error);
+					const decision = await options.queue.recordRetryFailure(ticket, {
+						maxRetries,
+						retryAfterMs,
+						kind,
+					});
+					if (decision.status === "exhausted") {
 						options.logger?.warn?.("adaptive provider queue retry limit reached", {
 							provider: options.model.provider,
 							model: options.model.id,
 							kind,
-							attempt: retryAttempt,
-							maxRetries,
+							attempt: decision.attempt,
+							maxRetries: decision.maxRetries,
 						});
 						return false;
 					}
-					retryAttempt = retryNumber;
-					ticket ??= await options.queue.acquire(laneId);
-					const retryAfterMs = retryAfterMsFromError(error);
-					const delayMs = options.queue.backoffDelayMs(retryNumber, retryAfterMs);
+
 					options.logger?.warn?.("adaptive provider queue caught retryable error", {
 						provider: options.model.provider,
 						model: options.model.id,
 						kind,
-						attempt: retryNumber,
-						maxRetries,
-						delayMs,
+						attempt: decision.attempt,
+						maxRetries: decision.maxRetries,
+						delayMs: decision.delayMs,
 					});
-					await sleepWithSignal(delayMs, signal);
+					const retryWindow = await options.queue.waitForRetryWindow(ticket, signal);
+					if (retryWindow.status === "exhausted") return false;
+					replayCount += 1;
 					return true;
 				};
 
@@ -230,6 +305,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							continue;
 						}
 
+						const cancelled = event.type === "error" && isCancellation(event.error, signal);
 						const retryKind = isAdaptiveRateLimit(event.error)
 							? "rate-limit"
 							: isAdaptiveTransientTransport(event.error)
@@ -237,6 +313,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 								: undefined;
 						if (
 							event.type === "error" &&
+							!cancelled &&
 							!hasSubstantiveOutput &&
 							!substantiveContentExists(event.error) &&
 							retryKind !== undefined
@@ -246,38 +323,50 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 								break;
 							}
 							flushReplaySafeEvents();
-							pushEvent(event);
 							ticket = await releaseTicket(options.queue, ticket);
+							pushEvent(event);
 							return;
 						}
 
 						flushReplaySafeEvents();
 						replayUnsafe = event.type !== "error";
-						hasSubstantiveOutput ||= isSubstantiveOutputEvent(event);
-						pushEvent(event);
-						if (event.type === "done" || event.type === "error") {
+						const eventHasSubstantiveOutput = isSubstantiveOutputEvent(event);
+						hasSubstantiveOutput ||= eventHasSubstantiveOutput;
+						if (eventHasSubstantiveOutput || substantiveContentExists(event.error)) {
+							await options.queue.clearRetryState(ticket);
 							ticket = await releaseTicket(options.queue, ticket);
+						} else if (event.type === "error" && !cancelled && ticket) {
+							await options.queue.markRetryStateExhausted(ticket);
+						}
+						if (event.type === "done" || event.type === "error") {
+							if (event.type === "done") await options.queue.clearRetryState(ticket);
+							ticket = await releaseTicket(options.queue, ticket);
+							pushEvent(event);
 							return;
 						}
+						pushEvent(event);
 					}
 
 					if (retry) continue;
 					if (!output.done) {
 						const result = await input.result();
 						flushReplaySafeEvents();
-						ticket = await releaseTicket(options.queue, ticket);
 						throw new Error(`Provider stream ended without a terminal event (${result.stopReason ?? "unknown"})`);
 					}
 				} catch (error) {
+					const cancelled = isCancellation(error, signal);
 					const retryKind = isAdaptiveRateLimit(error)
 						? "rate-limit"
 						: isAdaptiveTransientTransport(error)
 							? "transport"
 							: undefined;
-					if (!hasSubstantiveOutput && retryKind !== undefined) {
+					if (!cancelled && !hasSubstantiveOutput && retryKind !== undefined) {
 						if (await waitForRetry(error, retryKind)) continue;
 					}
 					flushReplaySafeEvents();
+					if (!hasSubstantiveOutput && !cancelled && ticket) {
+						await options.queue.markRetryStateExhausted(ticket);
+					}
 					throw error;
 				}
 			}

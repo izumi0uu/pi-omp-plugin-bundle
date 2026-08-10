@@ -8,7 +8,8 @@
 - 真实请求返回限流或可恢复的传输错误时才进入 FIFO 队列。
 - 普通 `502`、普通 `503`、鉴权、额度和模型不可用错误不消耗 50 次队列预算。
 - `server_is_overloaded`、`stream_read_error`、超时、连接断开和不完整流与限流共享
-  50 次预算，避免瞬时服务拥塞或传输波动过早触发 fallback。
+  50 次预算；同一 endpoint + credential lane 的所有窗口共享这一份预算，避免瞬时服务
+  拥塞或传输波动过早触发 fallback。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
 - fallback 失败后保留冷却，避免无限来回切换；同时提供一次有界的原生 transport 尝试。
 
@@ -50,7 +51,17 @@ retry:
 
 限流和可恢复传输错误共享同一个计数器，不会分别获得两套预算。只有 thinking 的流
 仍可重试，后续尝试会抑制重复的 thinking 和 stream envelope；一旦已经输出正文、
-tool call 或图片，就不重放。手动取消会立即中断等待。
+tool call 或图片，就不重放。手动取消会立即中断等待，但不会清空正在恢复的 lane 状态。
+
+### 跨窗口恢复状态
+
+- 健康 lane 不限制初始并发；只有真实请求失败后才创建共享恢复状态。
+- 每个 endpoint + credential lane 只有一份 50 次恢复预算，FIFO 队首是唯一探针，
+  其余窗口只排队等待。
+- 探针成功完成，或开始输出正文、tool call、图片时，立即清除共享状态并释放队列。
+- 第 50 次重试仍失败，或活动探针在输出内容前遇到不可恢复错误时，lane 会保留 5 分钟
+  `exhausted` 状态。等待者和新请求不再访问上游，直接交给 OMP fallback。
+- 探针窗口取消或进程退出时，下一位存活的队首沿用原计数和重试时间，不从 0 开始。
 
 ## 错误路由
 
@@ -63,7 +74,8 @@ tool call 或图片，就不重放。手动取消会立即中断等待。
 | quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
 | model unavailable、no capacity、普通 `502`、普通 `503` | 立即交给 OMP fallback |
 | 已产生文本、tool call 或图片后的错误 | 不重放，直接结束当前流 |
-| queued provider 的第 50 次可恢复错误仍失败 | 把最后一次错误交给 OMP fallback |
+| queued provider 的第 50 次重试仍失败 | 把最后一次错误交给 OMP fallback，并缓存 lane exhaustion 5 分钟 |
+| lane exhaustion 缓存期间的新请求或等待者 | 不访问上游，直接交给 OMP fallback |
 
 ## Fallback Chain
 
@@ -107,6 +119,10 @@ retry:
 不会绕过真实的上游故障。
 
 ## 冷却与恢复
+
+插件自身的 lane exhaustion 会缓存 5 分钟，用于让同一故障域的所有窗口停止探测并快速
+进入 fallback。它与下面的 OMP selector 冷却是两套独立状态：前者属于插件、按
+endpoint + credential lane 共享；后者属于 OMP、按 model selector 管理。
 
 OMP 会抑制刚失败的 model selector。错误没有明确 `Retry-After` 且分类未知时，
 抑制窗口通常约为 5 分钟。`fallbackRevertPolicy: cooldown-expiry` 会在主 selector

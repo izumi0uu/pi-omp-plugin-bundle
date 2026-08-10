@@ -9,8 +9,9 @@ OMP request
   -> send immediately when no backlog exists
   -> retryable rate-limit or transport failure before text/tool/image output
   -> join credential-scoped FIFO lane
-  -> share one 50-attempt budget with staged backoff
-  -> release lane after the whole stream terminates
+  -> share one cross-process 50-retry campaign with staged backoff
+  -> let only the FIFO head probe recovery
+  -> clear state and release the lane after recovery is observed
 ```
 
 Concurrency/rate-limit errors, explicit temporary server overloads and transient
@@ -33,7 +34,14 @@ turn into a rapid retry storm:
 | After 50 | Forward the last retryable error to OMP fallback |
 
 A small positive jitter remains on staged delays to avoid synchronized retries,
-but no wait can exceed five minutes. Cancellation interrupts a pending wait.
+but no wait can exceed five minutes. The queue head is the only recovery probe;
+other OMP windows wait instead of starting their own retry campaigns. Text, a
+tool call, an image or successful completion clears shared state. Exhaustion or
+a terminal pre-content probe failure remains cached for five minutes, so queued
+and newly arriving requests reach OMP fallback without contacting upstream.
+Cancellation interrupts the current wait and releases its ticket, while the
+next live queue head can claim the active campaign without resetting its count
+or retry deadline.
 
 Set OMP's global `retry.maxRetries` to `0`, as shown in
 [`examples/config.yml`](examples/config.yml). The extension owns transient
@@ -55,6 +63,8 @@ cooldown behavior and diagnostic commands are recorded in
 | 401/403 authentication failure | Forward to OMP fallback |
 | Model unavailable, no capacity or generic 5xx | Forward to OMP fallback |
 | Error after text, tool call or image output | Forward unchanged; never replay partial output |
+| 50th queued retry still fails | Forward to OMP fallback and cache lane exhaustion for five minutes |
+| New request while lane exhaustion is cached | Forward to OMP fallback without contacting upstream |
 
 ## Registered providers
 
@@ -124,7 +134,7 @@ npm test
 npm run pack:check
 ```
 
-The tests cover error classification, retry-after parsing, Responses compatibility, cancellation, stale ticket cleanup, replay boundaries and FIFO coordination between separate processes.
+The tests cover error classification, retry-after parsing, Responses compatibility, cancellation, stale ticket cleanup, replay boundaries, shared retry counters, exhaustion propagation, success clearing and owner takeover between separate processes.
 
 ## Compatibility
 
@@ -134,7 +144,13 @@ The tests cover error classification, retry-after parsing, Responses compatibili
 
 ## Runtime state
 
-Tickets default to `~/.omp/run/adaptive-provider-queue/`. Lane directories are created with `0700`; ticket files use `0600`. Dead-process and stale tickets are removed during queue scans.
+Tickets default to `~/.omp/run/adaptive-provider-queue/`. Lane directories are
+created with `0700`; ticket files use `0600`. Each endpoint + credential lane
+may also contain one `retry-state.json`, written as a mode-`0600` temporary file
+and atomically replaced. It records only active/exhausted status, shared attempt
+count, ticket owner, next retry, expiry and last failure kind. Raw credentials
+are never stored. Dead-process and stale tickets are removed during queue scans;
+the next FIFO head claims any still-active state.
 
 ## License
 

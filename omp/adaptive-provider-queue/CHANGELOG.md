@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 - 2026-08-11
+
+- Share one persisted retry campaign across every OMP process using the same
+  endpoint and credential lane; only the FIFO head probes provider recovery.
+- Clear shared state on successful or substantive output. Keep exhausted state
+  for five minutes so waiting and newly arriving requests reach OMP fallback
+  without contacting the unhealthy upstream.
+- Let the next live queue head claim an active campaign after cancellation or
+  process exit without resetting its retry count or deadline.
+- Write credential-free lane state through atomic replacement. API keys remain
+  represented only by the existing hashed lane identity.
+
 ## 0.1.4 - 2026-08-11
 
 - Treat explicit temporary server-overload responses as retryable congestion,

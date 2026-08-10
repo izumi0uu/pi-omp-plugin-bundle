@@ -7,6 +7,7 @@ import { afterEach, test } from "node:test";
 import { AdaptiveProviderQueue, createLaneId, sleepWithSignal } from "../src/queue.ts";
 import { toOpenAIResponsesModel } from "../src/responses-model.ts";
 import {
+	AdaptiveRetryExhaustedError,
 	createAdaptiveStream,
 	isAdaptiveRateLimit,
 	isAdaptiveTransientTransport,
@@ -23,6 +24,14 @@ async function tempRoot(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-adaptive-queue-test-"));
 	tempDirs.push(dir);
 	return dir;
+}
+
+async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!(await predicate())) {
+		if (Date.now() >= deadline) throw new Error(`condition was not met within ${timeoutMs}ms`);
+		await sleepWithSignal(10);
+	}
 }
 
 test("lane identity shares an endpoint only when the credential also matches", () => {
@@ -152,6 +161,68 @@ test("queue waits honor cancellation and release remains idempotent", async () =
 	await queue.release(first);
 });
 
+test("retry attempts are shared when the next ticket takes over an active campaign", async () => {
+	const rootDir = await tempRoot();
+	const firstQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const secondQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const first = await firstQueue.acquire("lane");
+	await firstQueue.waitForTurn(first);
+	assert.deepEqual(
+		await firstQueue.recordRetryFailure(first, { maxRetries: 50, kind: "rate-limit" }),
+		{ status: "retry", attempt: 1, maxRetries: 50, delayMs: 0 },
+	);
+	await firstQueue.release(first);
+
+	const second = await secondQueue.acquire("lane");
+	await secondQueue.waitForTurn(second);
+	const takeover = await secondQueue.waitForRetryWindow(second);
+	assert.equal(takeover.status, "ready");
+	assert.equal(takeover.status === "ready" && takeover.claimed, true);
+	assert.equal(takeover.status === "ready" && takeover.state?.attempt, 1);
+	assert.deepEqual(
+		await secondQueue.recordRetryFailure(second, { maxRetries: 10, kind: "transport" }),
+		{ status: "retry", attempt: 2, maxRetries: 50, delayMs: 0 },
+	);
+	await secondQueue.release(second);
+});
+
+test("exhaustion persists for later tickets without resetting or incrementing the counter", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const owner = await queue.acquire("lane");
+	await queue.waitForTurn(owner);
+	assert.equal((await queue.recordRetryFailure(owner, { maxRetries: 1, kind: "rate-limit" })).status, "retry");
+	assert.deepEqual(
+		await queue.recordRetryFailure(owner, { maxRetries: 1, kind: "transport" }),
+		{ status: "exhausted", attempt: 1, maxRetries: 1 },
+	);
+	await queue.release(owner);
+
+	const follower = await queue.acquire("lane");
+	await queue.waitForTurn(follower);
+	const exhausted = await queue.waitForRetryWindow(follower);
+	assert.equal(exhausted.status, "exhausted");
+	assert.equal(exhausted.state.attempt, 1);
+	assert.equal(exhausted.state.maxRetries, 1);
+	assert.deepEqual(
+		await queue.recordRetryFailure(follower, { maxRetries: 50, kind: "rate-limit" }),
+		{ status: "exhausted", attempt: 1, maxRetries: 1 },
+	);
+	await queue.release(follower);
+});
+
+test("a successful probe clears the lane retry state", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const ticket = await queue.acquire("lane");
+	await queue.waitForTurn(ticket);
+	await queue.recordRetryFailure(ticket, { maxRetries: 50, kind: "rate-limit" });
+	assert.equal((await queue.getRetryState("lane"))?.attempt, 1);
+	await queue.clearRetryState(ticket);
+	assert.equal(await queue.getRetryState("lane"), undefined);
+	await queue.release(ticket);
+});
+
 test("separate processes share one FIFO retry lane", async () => {
 	const rootDir = await tempRoot();
 	const auditPath = path.join(rootDir, "audit.log");
@@ -182,6 +253,36 @@ test("separate processes share one FIFO retry lane", async () => {
 		assert.equal(rows[index + 1][0], "end");
 		assert.equal(rows[index][1], rows[index + 1][1]);
 	}
+});
+
+test("the next process claims retry state after the probe owner exits", async () => {
+	const rootDir = await tempRoot();
+	const childPath = path.join(import.meta.dirname, "retry-owner-child.ts");
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn(process.execPath, ["--experimental-strip-types", childPath, rootDir, "crash-lane"], {
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		let stderr = "";
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", chunk => {
+			stderr += chunk;
+		});
+		child.on("error", reject);
+		child.on("exit", code => {
+			if (code === 0) resolve();
+			else reject(new Error(`retry owner child exited ${code}: ${stderr}`));
+		});
+	});
+
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 5_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const successor = await queue.acquire("crash-lane");
+	await queue.waitForTurn(successor);
+	const takeover = await queue.waitForRetryWindow(successor);
+	assert.equal(takeover.status, "ready");
+	assert.equal(takeover.status === "ready" && takeover.claimed, true);
+	assert.equal(takeover.status === "ready" && takeover.state?.attempt, 1);
+	assert.equal((await queue.getRetryState("crash-lane"))?.ownerFileName, successor.fileName);
+	await queue.release(successor);
 });
 
 class FakeInputStream implements AsyncIterable<any> {
@@ -248,6 +349,214 @@ test("stream wrapper discards pre-content 429 attempts and emits only the succes
 	await output.completion.promise;
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 	assert.equal(attempts.length, 0);
+});
+
+test("successful substantive output clears a retry campaign inherited from another window", async () => {
+	const rootDir = await tempRoot();
+	const ownerQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const probeQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test" };
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	const owner = await ownerQueue.acquire(laneId);
+	await ownerQueue.waitForTurn(owner);
+	await ownerQueue.recordRetryFailure(owner, { maxRetries: 50, kind: "rate-limit" });
+	await ownerQueue.release(owner);
+
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const output = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue: probeQueue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () =>
+			new FakeInputStream([
+				{ type: "start", partial: succeeded },
+				{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+				{ type: "done", reason: "stop", message: succeeded },
+			]),
+	});
+	await output.completion.promise;
+	assert.equal(await probeQueue.getRetryState(laneId), undefined);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+});
+
+test("two concurrent windows share one retry attempt and discard the follower's stale failure", async () => {
+	const rootDir = await tempRoot();
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test" };
+	const failed = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const firstAttemptsReady = Promise.withResolvers<void>();
+	let firstAttemptsStarted = 0;
+	const loggedAttempts: number[] = [];
+	const logger = {
+		warn(message: string, fields?: Record<string, unknown>) {
+			if (message === "adaptive provider queue caught retryable error") {
+				loggedAttempts.push(Number(fields?.attempt));
+			}
+		},
+	};
+	const makeFactory = () => {
+		let calls = 0;
+		return {
+			get calls() {
+				return calls;
+			},
+			create() {
+				calls += 1;
+				if (calls > 1) {
+					return new FakeInputStream([
+						{ type: "start", partial: succeeded },
+						{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+						{ type: "done", reason: "stop", message: succeeded },
+					]);
+				}
+				return {
+					async *[Symbol.asyncIterator]() {
+						firstAttemptsStarted += 1;
+						if (firstAttemptsStarted === 2) firstAttemptsReady.resolve();
+						await firstAttemptsReady.promise;
+						yield { type: "start", partial: assistant() };
+						yield { type: "error", reason: "error", error: failed };
+					},
+					async result() {
+						return failed;
+					},
+				};
+			},
+		};
+	};
+	const firstFactory = makeFactory();
+	const secondFactory = makeFactory();
+	const firstQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const secondQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const firstOutput = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue: firstQueue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => firstFactory.create(),
+		logger,
+	});
+	const secondOutput = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue: secondQueue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => secondFactory.create(),
+		logger,
+	});
+
+	await Promise.all([firstOutput.completion.promise, secondOutput.completion.promise]);
+	assert.equal(firstFactory.calls, 2);
+	assert.equal(secondFactory.calls, 2);
+	assert.deepEqual(loggedAttempts, [1]);
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	assert.equal(await firstQueue.getRetryState(laneId), undefined);
+	assert.equal(await firstQueue.hasWaiters(laneId), false);
+});
+
+test("a new request under exhausted shared state reaches fallback without contacting upstream", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test" };
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	const owner = await queue.acquire(laneId);
+	await queue.waitForTurn(owner);
+	assert.equal(
+		(await queue.recordRetryFailure(owner, { maxRetries: 0, kind: "rate-limit" })).status,
+		"exhausted",
+	);
+	await queue.release(owner);
+
+	let upstreamCalls = 0;
+	const output = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			return new FakeInputStream([]);
+		},
+	});
+	await assert.rejects(output.completion.promise, error => error instanceof AdaptiveRetryExhaustedError);
+	assert.equal(upstreamCalls, 0);
+	await waitUntil(async () => !(await queue.hasWaiters(laneId)));
+});
+
+test("cancelling the probe releases its ticket but preserves takeover state", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 100, maxDelayMs: 100 });
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test", signal: new AbortController().signal };
+	const controller = new AbortController();
+	requestOptions.signal = controller.signal;
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	const failed = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	const output = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () =>
+			new FakeInputStream([
+				{ type: "start", partial: assistant() },
+				{ type: "error", reason: "error", error: failed },
+			]),
+	});
+	await waitUntil(async () => (await queue.getRetryState(laneId))?.attempt === 1);
+	controller.abort();
+	await assert.rejects(output.completion.promise, error => error instanceof Error && error.name === "AbortError");
+	await waitUntil(async () => !(await queue.hasWaiters(laneId)));
+	assert.equal((await queue.getRetryState(laneId))?.status, "active");
+
+	const successor = await queue.acquire(laneId);
+	await queue.waitForTurn(successor);
+	const takeover = await queue.waitForRetryWindow(successor);
+	assert.equal(takeover.status, "ready");
+	assert.equal(takeover.status === "ready" && takeover.claimed, true);
+	assert.equal(takeover.status === "ready" && takeover.state?.attempt, 1);
+	await queue.clearRetryState(successor);
+	await queue.release(successor);
+});
+
+test("an aborted stream event releases the probe without exhausting shared state", async () => {
+	const rootDir = await tempRoot();
+	const ownerQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const probeQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test" };
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	const owner = await ownerQueue.acquire(laneId);
+	await ownerQueue.waitForTurn(owner);
+	await ownerQueue.recordRetryFailure(owner, { maxRetries: 50, kind: "rate-limit" });
+	await ownerQueue.release(owner);
+
+	const aborted = assistant({ stopReason: "aborted", errorMessage: "Request was aborted" });
+	const output = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue: probeQueue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => new FakeInputStream([{ type: "error", reason: "aborted", error: aborted }]),
+	});
+	await output.completion.promise;
+	const preserved = await probeQueue.getRetryState(laneId);
+	assert.equal(preserved?.status, "active");
+	assert.equal(preserved?.attempt, 1);
+	assert.equal(preserved?.lastKind, "rate-limit");
+	await waitUntil(async () => !(await probeQueue.hasWaiters(laneId)));
+
+	const successor = await probeQueue.acquire(laneId);
+	await probeQueue.waitForTurn(successor);
+	const takeover = await probeQueue.waitForRetryWindow(successor);
+	assert.equal(takeover.status, "ready");
+	assert.equal(takeover.status === "ready" && takeover.claimed, true);
+	await probeQueue.clearRetryState(successor);
+	await probeQueue.release(successor);
 });
 
 test("stream wrapper forwards the last rate-limit error after the retry budget", async () => {

@@ -1,8 +1,8 @@
 {
   "name": "omp-adaptive-provider-queue",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "private": true,
-  "description": "Adaptive cross-process queue for transient provider concurrency limits in Oh My Pi",
+  "description": "Adaptive cross-process queue and shared retry budget for Oh My Pi providers",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/izumi0uu/pi-omp-plugin-bundle.git",
