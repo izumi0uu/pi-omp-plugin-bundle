@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 - 2026-08-11
+
+- Treat explicit temporary server-overload responses as retryable congestion,
+  including `server_is_overloaded`, the same message wrapped as `server_error`,
+  and explicit overload responses carrying HTTP 503.
+- Keep generic 5xx, model-unavailable and no-capacity failures on the immediate
+  fallback path.
+
 ## 0.1.3 - 2026-08-11
 
 - Use one 50-attempt staged retry budget for transient rate limits and transport

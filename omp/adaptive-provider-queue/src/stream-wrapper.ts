@@ -43,7 +43,9 @@ export const DEFAULT_MAX_RETRIES = 50;
 const QUOTA_OR_BILLING_PATTERN =
 	/insufficient[_ -]?quota|quota (?:exceeded|exhausted)|resource[_ -]?exhausted|usage[_ -]?limit[_ -]?reached|billing|credit|balance|spend(?:ing)?[_ -]?limit|monthly[_ -]?limit|daily[_ -]?limit/i;
 const MODEL_UNAVAILABLE_PATTERN =
-	/model.{0,40}(?:unavailable|not available|disabled|offline|not found|overloaded)|no available (?:model|channel|route)|no capacity|capacity exhausted|upstream unavailable|overloaded/i;
+	/model.{0,40}(?:unavailable|not available|disabled|offline|not found|overloaded)|no available (?:model|channel|route)|no capacity|capacity exhausted|upstream unavailable/i;
+const TRANSIENT_SERVER_OVERLOAD_PATTERN =
+	/server[_ -]?is[_ -]?overloaded|servers? (?:are )?(?:currently )?overloaded|server overload(?:ed)?/i;
 const TRANSIENT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit(?:ed| exceeded)?|retry (?:again )?later/i;
 const EXPLICIT_RATE_LIMIT_PATTERN =
@@ -80,6 +82,9 @@ export function isAdaptiveRateLimit(error: unknown): boolean {
 	const text = errorText(error);
 	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
 	const status = errorStatus(error);
+	if (TRANSIENT_SERVER_OVERLOAD_PATTERN.test(text)) {
+		return status === undefined || status === 429 || status === 503;
+	}
 	if (status === 429) return text.length === 0 || TRANSIENT_RATE_LIMIT_PATTERN.test(text) || !/\b(?:401|403|5\d\d)\b/.test(text);
 	return status === undefined && EXPLICIT_RATE_LIMIT_PATTERN.test(text);
 }

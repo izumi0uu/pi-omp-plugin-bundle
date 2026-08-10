@@ -6,9 +6,9 @@
 
 - 正常请求不设置固定并发上限。
 - 真实请求返回限流或可恢复的传输错误时才进入 FIFO 队列。
-- `502`、`503`、鉴权、额度和模型不可用错误不消耗 50 次队列预算。
-- `stream_read_error`、超时、连接断开和不完整流与限流共享 50 次预算，避免瞬时
-  传输波动过早触发 fallback。
+- 普通 `502`、普通 `503`、鉴权、额度和模型不可用错误不消耗 50 次队列预算。
+- `server_is_overloaded`、`stream_read_error`、超时、连接断开和不完整流与限流共享
+  50 次预算，避免瞬时服务拥塞或传输波动过早触发 fallback。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
 - fallback 失败后保留冷却，避免无限来回切换；同时提供一次有界的原生 transport 尝试。
 
@@ -24,9 +24,10 @@ modelRoles:
 ```
 
 `default`、`slow` 和 `plan` 都使用 adaptive queue transport。主模型在输出正文、
-tool call 或图片前遇到限流或可恢复传输错误时，会执行同一套 50 次分段重试；遇到
-`502`、`503`、鉴权、额度或模型不可用错误时才立即进入 fallback。手动选择普通
-`aiinput` 会绕过这套内部队列并采用 fail-fast 行为，两者不会自动互换。
+tool call 或图片前遇到限流、明确的临时服务器过载或可恢复传输错误时，会执行同一套
+50 次分段重试；遇到普通 `502/503`、鉴权、额度或模型不可用错误时才立即进入
+fallback。手动选择普通 `aiinput` 会绕过这套内部队列并采用 fail-fast 行为，两者
+不会自动互换。
 
 ## 重试归属
 
@@ -56,10 +57,11 @@ tool call 或图片，就不重放。手动取消会立即中断等待。
 | 错误 | 行为 |
 |---|---|
 | 输出正文/tool/image 前的 `429`、concurrency、rate limit | 排队并使用共享 50 次预算 |
+| 明确的 `server_is_overloaded` / `servers are currently overloaded`，包括带 503 的同义响应 | 排队并使用共享 50 次预算 |
 | 输出正文/tool/image 前的 `stream_read_error`、timeout、socket/fetch/network failure、不完整流 | 排队并使用共享 50 次预算 |
 | `401`、`403`、token revoked | 立即交给 OMP fallback |
 | quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
-| model unavailable、no capacity、`502`、`503` | 立即交给 OMP fallback |
+| model unavailable、no capacity、普通 `502`、普通 `503` | 立即交给 OMP fallback |
 | 已产生文本、tool call 或图片后的错误 | 不重放，直接结束当前流 |
 | queued provider 的第 50 次可恢复错误仍失败 | 把最后一次错误交给 OMP fallback |
 

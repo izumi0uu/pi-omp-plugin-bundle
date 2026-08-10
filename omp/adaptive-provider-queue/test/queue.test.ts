@@ -40,11 +40,15 @@ test("transient concurrency limits queue while quota and unavailable errors pass
 	);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "Too many pending requests, retry later" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "" }), true);
+	assert.equal(isAdaptiveRateLimit({ errorMessage: "Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later." }), true);
+	assert.equal(isAdaptiveRateLimit({ errorMessage: "Error Code server_error: Our servers are currently overloaded. Please try again later." }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "insufficient_quota: add credits" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "resource_exhausted: quota exceeded" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "model overloaded: no capacity" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "model unavailable" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "rate limit exceeded" }), false);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 401, errorMessage: "authentication failed" }), false);
 });
 
@@ -329,6 +333,34 @@ test("rate limits and transport failures consume one shared retry budget", async
 	await output.completion.promise;
 	assert.equal(attempts.length, 0);
 	assert.equal(output.events.at(-1).error, interrupted);
+});
+
+test("explicit server overload retries instead of reaching fallback", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const overloaded = assistant({
+		errorMessage: "Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+	});
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const attempts = [
+		new FakeInputStream([{ type: "start", partial: assistant() }, { type: "error", reason: "error", error: overloaded }]),
+		new FakeInputStream([
+			{ type: "start", partial: succeeded },
+			{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+			{ type: "done", reason: "stop", message: succeeded },
+		]),
+	];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => attempts.shift()!,
+	});
+	await output.completion.promise;
+	assert.equal(attempts.length, 0);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 });
 
 test("stream wrapper does not replay a transport drop after substantive text", async () => {
