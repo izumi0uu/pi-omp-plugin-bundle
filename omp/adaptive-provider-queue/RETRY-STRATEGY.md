@@ -7,6 +7,8 @@
 - 正常请求不设置固定并发上限。
 - 只有真实请求返回 pre-content 并发或限流错误时才进入 FIFO 队列。
 - `502`、`503`、鉴权、额度和模型不可用错误不消耗 50 次队列预算。
+- pre-content 的 `stream_read_error` 和连接断开先进行 3 次短重试，避免单次断流
+  立即触发 fallback。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
 - fallback 失败后保留冷却，避免无限来回切换；同时提供一次有界的原生 transport 尝试。
 
@@ -45,6 +47,18 @@ retry:
 | 31-40 | 每次 3 分钟 |
 | 41-50 | 每次 5 分钟封顶 |
 
+传输层错误使用独立的小预算，不进入上述 50 次限流预算：
+
+| 传输重试编号 | 等待 |
+|---|---|
+| 1 | 2 秒 |
+| 2 | 4 秒 |
+| 3 | 8 秒 |
+| 3 次后 | 将最后一次错误交给 OMP fallback |
+
+传输重试单次最多等待 15 秒。只有 thinking 的流可以重试，后续尝试会抑制重复的
+thinking 和 stream envelope；一旦已经输出正文、tool call 或图片，就不重放。
+
 这 50 次只适用于尚未产生实质内容的并发或限流错误。手动取消会立即中断等待。
 
 ## 错误路由
@@ -52,10 +66,11 @@ retry:
 | 错误 | 行为 |
 |---|---|
 | Pre-content `429`、concurrency、rate limit | queued provider 排队并分段重试 |
+| Pre-content `stream_read_error`、socket reset、fetch/network failure | 先短重试 3 次，再交给 OMP fallback |
 | `401`、`403`、token revoked | 立即交给 OMP fallback |
 | quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
 | model unavailable、no capacity、`502`、`503` | 立即交给 OMP fallback |
-| 已产生文本、thinking、tool call 或图片后的错误 | 不重放，直接结束当前流 |
+| 已产生文本、tool call 或图片后的错误 | 不重放，直接结束当前流 |
 | queued provider 的第 50 次仍限流 | 把最后一次错误交给 OMP fallback |
 
 ## Fallback Chain

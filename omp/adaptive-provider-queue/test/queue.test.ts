@@ -6,7 +6,13 @@ import * as path from "node:path";
 import { afterEach, test } from "node:test";
 import { AdaptiveProviderQueue, createLaneId, sleepWithSignal } from "../src/queue.ts";
 import { toOpenAIResponsesModel } from "../src/responses-model.ts";
-import { createAdaptiveStream, isAdaptiveRateLimit, retryAfterMsFromError } from "../src/stream-wrapper.ts";
+import {
+	createAdaptiveStream,
+	isAdaptiveRateLimit,
+	isAdaptiveTransientTransport,
+	retryAfterMsFromError,
+	transportRetryDelayMs,
+} from "../src/stream-wrapper.ts";
 
 const tempDirs: string[] = [];
 
@@ -46,6 +52,17 @@ test("transient concurrency limits queue while quota and unavailable errors pass
 test("retry-after hints are parsed without turning quota errors into queue waits", () => {
 	assert.equal(retryAfterMsFromError({ errorMessage: "retry after 2.5 seconds" }), 2_500);
 	assert.equal(retryAfterMsFromError({ errorMessage: "try again in 750ms" }), 750);
+});
+
+test("transient transport errors use a short bounded retry budget", () => {
+	assert.equal(isAdaptiveTransientTransport({ errorMessage: "Error Code stream_read_error: stream_read_error" }), true);
+	assert.equal(isAdaptiveTransientTransport(new Error("socket connection was closed unexpectedly")), true);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "stream_read_error" }), false);
+	assert.equal(isAdaptiveTransientTransport({ errorMessage: "model overloaded" }), false);
+	assert.equal(transportRetryDelayMs(1, 2_000), 2_000);
+	assert.equal(transportRetryDelayMs(2, 2_000), 4_000);
+	assert.equal(transportRetryDelayMs(3, 2_000), 8_000);
+	assert.equal(transportRetryDelayMs(10, 2_000), 15_000);
 });
 
 test("retry backoff uses ten-attempt stages and caps every wait at five minutes", () => {
@@ -254,6 +271,66 @@ test("stream wrapper forwards the last rate-limit error after the retry budget",
 	});
 	await output.completion.promise;
 	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error, failed);
+});
+
+test("stream wrapper retries a thinking-only transport drop without duplicating thinking", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = assistant({ errorMessage: "Error Code stream_read_error: stream_read_error" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const attempts = [
+		new FakeInputStream([
+			{ type: "start", partial: assistant() },
+			{ type: "thinking_start", contentIndex: 0, partial: assistant() },
+			{ type: "thinking_delta", contentIndex: 0, delta: "check", partial: assistant() },
+			{ type: "error", reason: "error", error: failed },
+		]),
+		new FakeInputStream([
+			{ type: "start", partial: succeeded },
+			{ type: "thinking_start", contentIndex: 0, partial: succeeded },
+			{ type: "thinking_delta", contentIndex: 0, delta: "check again", partial: succeeded },
+			{ type: "text_start", contentIndex: 0, partial: succeeded },
+			{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+			{ type: "done", reason: "stop", message: succeeded },
+		]),
+	];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxTransportRetries: 1,
+		transportRetryBaseDelayMs: 0,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => attempts.shift()!,
+	});
+	await output.completion.promise;
+	assert.equal(attempts.length, 0);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "thinking_start", "thinking_delta", "text_start", "text_delta", "done"]);
+	assert.equal(output.events.filter(event => event.type === "thinking_delta").length, 1);
+});
+
+test("stream wrapper does not replay a transport drop after substantive text", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = assistant({ errorMessage: "Error Code stream_read_error: stream_read_error" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([
+				{ type: "start", partial: assistant() },
+				{ type: "text_delta", contentIndex: 0, delta: "partial", partial: failed },
+				{ type: "error", reason: "error", error: failed },
+			]);
+		},
+	});
+	await output.completion.promise;
+	assert.equal(attempts, 1);
 	assert.equal(output.events.at(-1).error, failed);
 });
 

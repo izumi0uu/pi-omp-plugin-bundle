@@ -13,6 +13,20 @@ OMP request
   -> release lane after the whole stream terminates
 ```
 
+Pre-content stream transport failures such as `stream_read_error`, a reset
+socket or a failed fetch use a separate small retry budget before fallback:
+
+| Transport retry | Delay |
+|---|---|
+| 1 | 2 seconds |
+| 2 | 4 seconds |
+| 3 | 8 seconds |
+| After 3 | Forward the error to OMP fallback |
+
+The transport delay is capped at 15 seconds. Thinking-only output may be
+retried without duplicating the thinking block; once text, a tool call or an
+image has been emitted, the stream is never replayed.
+
 Retry pacing is deliberately staged so a temporary provider limit does not
 turn into a rapid retry storm:
 
@@ -42,6 +56,7 @@ cooldown behavior and diagnostic commands are recorded in
 | Failure | Action |
 |---|---|
 | Pre-content concurrency/rate-limit 429 | Queue and retry |
+| Pre-content stream/connection transport error | Retry up to 3 times, then fallback |
 | 429 quota, credits or billing exhausted | Forward to OMP fallback |
 | 401/403 authentication failure | Forward to OMP fallback |
 | Model unavailable, no capacity or 5xx | Forward to OMP fallback |

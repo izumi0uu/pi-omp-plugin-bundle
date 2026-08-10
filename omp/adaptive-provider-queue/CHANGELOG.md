@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 - 2026-08-10
+
+- Retry pre-content stream and connection read failures up to three times with
+  a short capped backoff before handing the error to OMP fallback.
+- Suppress duplicate thinking and stream envelope events across transport
+  retries while preserving the no-replay boundary after text or tool output.
+
 ## 0.1.1 - 2026-08-10
 
 - Bound transient rate-limit retries to 50 attempts.
