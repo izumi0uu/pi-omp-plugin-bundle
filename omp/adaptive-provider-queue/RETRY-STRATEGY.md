@@ -20,15 +20,16 @@ modelRoles:
   default: aiinput-queued/gpt-5.6-sol:max
   slow: aiinput-queued/gpt-5.6-sol:max
   plan: aiinput-queued/gpt-5.6-sol:max
+  designer: kimi-code-queued/k3:max
   research: tokenking-grok-queued/grok-4.5:high
   perplexity: tokenking-grok-queued/grok-4.5:high
 ```
 
-`default`、`slow` 和 `plan` 都使用 adaptive queue transport。主模型在输出正文、
-tool call 或图片前遇到限流、明确的临时服务器过载或可恢复传输错误时，会执行同一套
-50 次分段重试；遇到普通 `502/503`、鉴权、额度或模型不可用错误时才立即进入
-fallback。手动选择普通 `aiinput` 会绕过这套内部队列并采用 fail-fast 行为，两者
-不会自动互换。
+`default`、`slow`、`plan` 和 `designer` 都使用 adaptive queue transport。主模型在
+输出正文、tool call 或图片前遇到限流、明确的临时服务器过载或可恢复传输错误时，会
+执行同一套 50 次分段重试；遇到普通 `502/503`、鉴权、额度或模型不可用错误时才立即
+进入 fallback。手动选择普通 `aiinput` 或 `kimi-code` 会绕过这套内部队列并采用
+fail-fast 行为，与 queued selector 不会自动互换。
 
 ## 重试归属
 
@@ -96,6 +97,9 @@ retry:
     aiinput-overseas/*:
       - tokenking-queued/gpt-5.6-sol:max
       - tokenking/gpt-5.6-sol:max
+    kimi-code-queued/*:
+      - tokenking-queued/gpt-5.6-sol:max
+      - tokenking/gpt-5.6-sol:max
     kimi-code/*:
       - tokenking-queued/gpt-5.6-sol:max
       - tokenking/gpt-5.6-sol:max
@@ -106,6 +110,11 @@ retry:
       - tokenking-queued/gpt-5.6-sol:max
       - tokenking/gpt-5.6-sol:max
 ```
+
+`kimi-code-queued/*` 复用 OMP 内置 `kimi-code` 登录保存的凭据，但请求经过 adaptive
+queue transport，并参与同一 endpoint + credential lane 的共享恢复活动。内置
+`kimi-code/*` selector 绕过插件队列，仍使用 OMP 的直接 transport；两者指向同一
+Kimi Code 服务，不是相互独立的供应商或账号。
 
 两个 TokenKing selector 使用相同的 `TOKENKING_API_KEY` 和
 `https://api.tokenskingdom.com/v1`：
@@ -154,6 +163,7 @@ omp config get retry.fallbackRevertPolicy
 omp config get retry.fallbackChains --json
 omp models aiinput-queued --json
 omp models tokenking-queued --json
+omp models kimi-code-queued --json
 ```
 
 预期结果：
@@ -162,6 +172,7 @@ omp models tokenking-queued --json
 - `retry.modelFallback` 为 `true`。
 - `retry.fallbackRevertPolicy` 为 `cooldown-expiry`。
 - queued provider 仍在各自扩展内保持 `maxRetries: 50`。
+- `kimi-code-queued` 列出 7 个模型，并复用内置 `kimi-code` 登录凭据。
 
 `Retry failed after 0 attempts` 表示 OMP 外层没有追加重试，通常意味着当前 fallback
 chain 已耗尽、候选处于冷却或候选不可用；它不表示 queued provider 的内部 50 次预算

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 - 2026-08-11
+
+- Register `kimi-code-queued` with adaptive queue transport for all seven Kimi
+  Code models exposed by the extension.
+- Reuse the credential stored by OMP's built-in `kimi-code` login through a
+  command-backed provider value, without copying a Kimi key into the repository
+  or requiring one in `.env`.
+- Keep the built-in `kimi-code` selector available as the direct, non-queued
+  transport for callers that explicitly choose it.
+- Raise the verified OMP runtime to `17.2.12`, whose `streamKimi` export and
+  model contract back this provider.
+
 ## 0.2.0 - 2026-08-11
 
 - Share one persisted retry campaign across every OMP process using the same

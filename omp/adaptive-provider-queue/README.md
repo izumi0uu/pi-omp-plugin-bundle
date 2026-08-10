@@ -68,14 +68,26 @@ cooldown behavior and diagnostic commands are recorded in
 
 ## Registered providers
 
-| Provider | Endpoint | Model | Credential variable |
+| Provider | Endpoint | Model | Credential source |
 |---|---|---|---|
 | `aiinput-queued` | `https://ai.input.im/v1` | `gpt-5.6-sol` | `AIINPUT_API_KEY` |
 | `aiinput-overseas-queued` | `https://input.codes/v1` | `gpt-5.6-sol` | `AIINPUT_API_KEY` |
 | `tokenking-queued` | `https://api.tokenskingdom.com/v1` | `gpt-5.6-sol` | `TOKENKING_API_KEY` |
 | `tokenking-grok-queued` | `https://api.tokenskingdom.com/v1` | `grok-4.5` | `TOKENKING_GROK_API_KEY` |
+| `kimi-code-queued` | `https://api.kimi.com/coding/v1` | 7 models: K3, K3-256k, K2.7 Coding, K2.7 Coding Highspeed, K2, K2 Turbo and K2.5 | Stored `kimi-code` login via `!omp token kimi-code --raw` |
 
-No API key is stored in queue metadata. The lane identity hashes endpoint origin and credential scope with SHA-256.
+`kimi-code-queued` reuses the credential already stored by `omp login kimi-code`.
+OMP resolves it through the command-backed provider value
+`!omp token kimi-code --raw`; no Kimi key is copied into this repository or
+required in `.env`. Command-backed values are cached for the lifetime of an OMP
+process, so restart existing OMP windows after logging in again. No API key is
+stored in queue metadata. The lane identity hashes endpoint origin and
+credential scope with SHA-256.
+
+The seven queued model entries are a static mirror of OMP `17.2.12`'s current
+Kimi Code catalog. The built-in `kimi-code` provider can refresh its model list
+dynamically; newly added or changed Kimi models require an explicit update here
+before they appear under `kimi-code-queued`.
 
 ## Install
 
@@ -134,11 +146,13 @@ npm test
 npm run pack:check
 ```
 
-The tests cover error classification, retry-after parsing, Responses compatibility, cancellation, stale ticket cleanup, replay boundaries, shared retry counters, exhaustion propagation, success clearing and owner takeover between separate processes.
+The tests cover error classification, retry-after parsing, Responses compatibility, Kimi credential and model adaptation, cancellation, stale ticket cleanup, replay boundaries, shared retry counters, exhaustion propagation, success clearing and owner takeover between separate processes.
 
 ## Compatibility
 
-- Verified with OMP `17.2.2`.
+- Verified with OMP `17.2.12`. The queued Kimi transport relies on that
+  version's `streamKimi` export and model contract; older OMP releases are not
+  covered by the current verification.
 - Uses OMP's `@oh-my-pi/pi-ai` and `@oh-my-pi/pi-coding-agent` runtime modules.
 - The current source is OMP-native and is not declared compatible with standalone Pi.
 

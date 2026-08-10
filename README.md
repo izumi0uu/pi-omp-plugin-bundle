@@ -15,7 +15,7 @@ pi-omp-plugin-bundle/
 
 | Runtime | Plugin | Status |
 |---|---|---|
-| OMP 17.2.2 | `adaptive-provider-queue` | Locally verified; newer versions unverified |
+| OMP 17.2.12 | `adaptive-provider-queue` | Locally verified; other versions unverified |
 | OMP 17.2.x | `omp-pi-tool-display` | Ported from upstream `v0.5.0`; pure tests and isolated OMP 17.2.4 load verified |
 | OMP Role | `perplexity` | Dedicated main-agent window using Perplexity-first `web_search` |
 | Pi | - | Reserved for native Pi ports |
