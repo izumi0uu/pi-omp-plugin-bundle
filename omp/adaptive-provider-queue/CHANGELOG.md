@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3 - 2026-08-11
+
+- Use one 50-attempt staged retry budget for transient rate limits and transport
+  failures instead of a separate three-attempt transport budget.
+- Treat thinking-only and redacted-thinking output as replayable while retaining
+  the hard no-replay boundary after text, tool calls or images.
+- Retry first-event timeouts and incomplete response streams as transport
+  failures.
+
 ## 0.1.2 - 2026-08-10
 
 - Retry pre-content stream and connection read failures up to three times with

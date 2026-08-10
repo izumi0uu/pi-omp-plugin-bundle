@@ -1,31 +1,23 @@
 # Adaptive Provider Queue for OMP
 
-OMP 原生 provider extension。正常状态不设置固定并发上限；只有上游返回可重试的并发/限流错误后，才为同一 endpoint + API key 建立跨 OMP 进程共享的 FIFO 队列。
+OMP 原生 provider extension。正常状态不设置固定并发上限；上游返回可重试的限流或传输错误后，才为同一 endpoint + API key 建立跨 OMP 进程共享的 FIFO 队列。
 
 ## Behavior
 
 ```text
 OMP request
   -> send immediately when no backlog exists
-  -> pre-content transient 429
+  -> retryable rate-limit or transport failure before text/tool/image output
   -> join credential-scoped FIFO lane
-  -> retry up to 50 times with staged backoff
+  -> share one 50-attempt budget with staged backoff
   -> release lane after the whole stream terminates
 ```
 
-Pre-content stream transport failures such as `stream_read_error`, a reset
-socket or a failed fetch use a separate small retry budget before fallback:
-
-| Transport retry | Delay |
-|---|---|
-| 1 | 2 seconds |
-| 2 | 4 seconds |
-| 3 | 8 seconds |
-| After 3 | Forward the error to OMP fallback |
-
-The transport delay is capped at 15 seconds. Thinking-only output may be
-retried without duplicating the thinking block; once text, a tool call or an
-image has been emitted, the stream is never replayed.
+Concurrency/rate-limit errors and transient transport failures such as
+`stream_read_error`, timeouts, reset sockets, incomplete streams or failed
+fetches consume the same retry counter and use the same pacing. Thinking-only
+output may be retried without duplicating the thinking block; once text, a tool
+call or an image has been emitted, the stream is never replayed.
 
 Retry pacing is deliberately staged so a temporary provider limit does not
 turn into a rapid retry storm:
@@ -37,14 +29,14 @@ turn into a rapid retry storm:
 | 21-30 | 2 minutes |
 | 31-40 | 3 minutes |
 | 41-50 | 5 minutes maximum |
-| After 50 | Forward the last rate-limit error to OMP fallback |
+| After 50 | Forward the last retryable error to OMP fallback |
 
 A small positive jitter remains on staged delays to avoid synchronized retries,
 but no wait can exceed five minutes. Cancellation interrupts a pending wait.
 
 Set OMP's global `retry.maxRetries` to `0`, as shown in
 [`examples/config.yml`](examples/config.yml). The extension owns transient
-concurrency retries; disabling the outer retry loop prevents a fallback model's
+retryable failures; disabling the outer retry loop prevents a fallback model's
 502/503 response from starting a second retry budget. `retry.modelFallback`
 remains enabled, so non-retryable failures can still traverse the configured
 fallback chain once.
@@ -55,12 +47,12 @@ cooldown behavior and diagnostic commands are recorded in
 
 | Failure | Action |
 |---|---|
-| Pre-content concurrency/rate-limit 429 | Queue and retry |
-| Pre-content stream/connection transport error | Retry up to 3 times, then fallback |
+| Concurrency/rate-limit 429 before text/tool/image | Queue and retry, shared 50-attempt budget |
+| Stream/connection transport error before text/tool/image | Queue and retry, shared 50-attempt budget |
 | 429 quota, credits or billing exhausted | Forward to OMP fallback |
 | 401/403 authentication failure | Forward to OMP fallback |
 | Model unavailable, no capacity or 5xx | Forward to OMP fallback |
-| Error after semantic content started | Forward unchanged; never replay partial output |
+| Error after text, tool call or image output | Forward unchanged; never replay partial output |
 
 ## Registered providers
 

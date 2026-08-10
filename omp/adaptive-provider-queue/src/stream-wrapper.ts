@@ -33,17 +33,12 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	requestOptions?: { apiKey?: unknown; signal?: AbortSignal; [key: string]: unknown };
 	queue: AdaptiveProviderQueue;
 	maxRetries?: number;
-	maxTransportRetries?: number;
-	transportRetryBaseDelayMs?: number;
 	createOutputStream(): TOutput;
 	createInputStream(): InputStreamLike;
 	logger?: QueueLogger;
 }
 
 export const DEFAULT_MAX_RETRIES = 50;
-export const DEFAULT_MAX_TRANSPORT_RETRIES = 3;
-export const DEFAULT_TRANSPORT_RETRY_BASE_DELAY_MS = 2_000;
-const MAX_TRANSPORT_RETRY_DELAY_MS = 15_000;
 
 const QUOTA_OR_BILLING_PATTERN =
 	/insufficient[_ -]?quota|quota (?:exceeded|exhausted)|resource[_ -]?exhausted|usage[_ -]?limit[_ -]?reached|billing|credit|balance|spend(?:ing)?[_ -]?limit|monthly[_ -]?limit|daily[_ -]?limit/i;
@@ -54,7 +49,7 @@ const TRANSIENT_RATE_LIMIT_PATTERN =
 const EXPLICIT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit[_ -]?exceeded|rate limit exceeded/i;
 const TRANSIENT_TRANSPORT_PATTERN =
-	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)/i;
+	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
 
 function errorText(error: unknown): string {
 	if (typeof error === "string") return error;
@@ -96,12 +91,6 @@ export function isAdaptiveTransientTransport(error: unknown): boolean {
 	return TRANSIENT_TRANSPORT_PATTERN.test(text);
 }
 
-export function transportRetryDelayMs(attempt: number, baseDelayMs = DEFAULT_TRANSPORT_RETRY_BASE_DELAY_MS): number {
-	const retryNumber = Math.max(1, Math.floor(attempt));
-	const base = Math.max(0, baseDelayMs);
-	return Math.min(MAX_TRANSPORT_RETRY_DELAY_MS, base * 2 ** Math.min(20, retryNumber - 1));
-}
-
 export function retryAfterMsFromError(error: unknown): number | undefined {
 	const text = errorText(error);
 	const milliseconds = /(?:retry|try again).{0,24}?(\d+(?:\.\d+)?)\s*ms\b/i.exec(text);
@@ -116,15 +105,14 @@ async function releaseTicket(queue: AdaptiveProviderQueue, ticket: QueueTicket |
 	return undefined;
 }
 
-function semanticContentExists(message: AssistantLike | undefined): boolean {
+function substantiveContentExists(message: AssistantLike | undefined): boolean {
 	const content = message?.content;
 	if (!Array.isArray(content)) return false;
 	return content.some(block => {
 		if (!block || typeof block !== "object") return false;
 		const item = block as Record<string, unknown>;
 		if (item.type === "text") return typeof item.text === "string" && item.text.length > 0;
-		if (item.type === "thinking") return typeof item.thinking === "string" && item.thinking.length > 0;
-		return item.type === "toolCall" || item.type === "image" || item.type === "redactedThinking";
+		return item.type === "toolCall" || item.type === "image";
 	});
 }
 
@@ -151,8 +139,6 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 	const output = options.createOutputStream();
 	const signal = options.requestOptions?.signal;
 	const maxRetries = Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES));
-	const maxTransportRetries = Math.max(0, Math.floor(options.maxTransportRetries ?? DEFAULT_MAX_TRANSPORT_RETRIES));
-	const transportRetryBaseDelayMs = Math.max(0, options.transportRetryBaseDelayMs ?? DEFAULT_TRANSPORT_RETRY_BASE_DELAY_MS);
 	const laneId = createLaneId({
 		provider: options.model.provider,
 		baseUrl: options.model.baseUrl,
@@ -161,8 +147,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 
 	void (async () => {
 		let ticket: QueueTicket | undefined;
-		let rateLimitAttempt = 0;
-		let transportAttempt = 0;
+		let retryAttempt = 0;
 		let emittedStart = false;
 		let emittedTextStart = false;
 		let emittedThinking = false;
@@ -195,7 +180,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						emittedTextStart = true;
 					}
 					if (isThinkingEvent(event)) {
-						if (transportAttempt > 0 && emittedThinking) return;
+						if (retryAttempt > 0 && emittedThinking) return;
 						emittedThinking = true;
 					}
 					output.push(event);
@@ -204,53 +189,28 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					for (const event of replaySafeEvents) pushEvent(event);
 					replaySafeEvents.length = 0;
 				};
-				const waitForRateLimitRetry = async (error: unknown): Promise<boolean> => {
-					const retryNumber = rateLimitAttempt + 1;
+				const waitForRetry = async (error: unknown, kind: "rate-limit" | "transport"): Promise<boolean> => {
+					const retryNumber = retryAttempt + 1;
 					if (retryNumber > maxRetries) {
 						options.logger?.warn?.("adaptive provider queue retry limit reached", {
 							provider: options.model.provider,
 							model: options.model.id,
-							attempt: rateLimitAttempt,
+							kind,
+							attempt: retryAttempt,
 							maxRetries,
 						});
 						return false;
 					}
-					rateLimitAttempt = retryNumber;
+					retryAttempt = retryNumber;
 					ticket ??= await options.queue.acquire(laneId);
 					const retryAfterMs = retryAfterMsFromError(error);
 					const delayMs = options.queue.backoffDelayMs(retryNumber, retryAfterMs);
-					options.logger?.warn?.("adaptive provider queue caught transient rate limit", {
+					options.logger?.warn?.("adaptive provider queue caught retryable error", {
 						provider: options.model.provider,
 						model: options.model.id,
+						kind,
 						attempt: retryNumber,
 						maxRetries,
-						delayMs,
-					});
-					await sleepWithSignal(delayMs, signal);
-					return true;
-				};
-				const waitForTransportRetry = async (error: unknown): Promise<boolean> => {
-					const retryNumber = transportAttempt + 1;
-					if (retryNumber > maxTransportRetries) {
-						options.logger?.warn?.("adaptive provider transport retry limit reached", {
-							provider: options.model.provider,
-							model: options.model.id,
-							attempt: transportAttempt,
-							maxRetries: maxTransportRetries,
-						});
-						return false;
-					}
-					transportAttempt = retryNumber;
-					const retryAfterMs = retryAfterMsFromError(error);
-					const delayMs = Math.min(
-						MAX_TRANSPORT_RETRY_DELAY_MS,
-						Math.max(transportRetryDelayMs(retryNumber, transportRetryBaseDelayMs), retryAfterMs ?? 0),
-					);
-					options.logger?.warn?.("adaptive provider queue caught transient transport error", {
-						provider: options.model.provider,
-						model: options.model.id,
-						attempt: retryNumber,
-						maxRetries: maxTransportRetries,
 						delayMs,
 					});
 					await sleepWithSignal(delayMs, signal);
@@ -265,29 +225,18 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							continue;
 						}
 
-						if (
-							!replayUnsafe &&
-							event.type === "error" &&
-							!semanticContentExists(event.error) &&
-							isAdaptiveRateLimit(event.error)
-						) {
-							if (await waitForRateLimitRetry(event.error)) {
-								retry = true;
-								break;
-							}
-							flushReplaySafeEvents();
-							output.push(event);
-							ticket = await releaseTicket(options.queue, ticket);
-							return;
-						}
-
+						const retryKind = isAdaptiveRateLimit(event.error)
+							? "rate-limit"
+							: isAdaptiveTransientTransport(event.error)
+								? "transport"
+								: undefined;
 						if (
 							event.type === "error" &&
 							!hasSubstantiveOutput &&
-							!semanticContentExists(event.error) &&
-							isAdaptiveTransientTransport(event.error)
+							!substantiveContentExists(event.error) &&
+							retryKind !== undefined
 						) {
-							if (await waitForTransportRetry(event.error)) {
+							if (await waitForRetry(event.error, retryKind)) {
 								retry = true;
 								break;
 							}
@@ -315,11 +264,13 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						throw new Error(`Provider stream ended without a terminal event (${result.stopReason ?? "unknown"})`);
 					}
 				} catch (error) {
-					if (!replayUnsafe && isAdaptiveRateLimit(error)) {
-						if (await waitForRateLimitRetry(error)) continue;
-					}
-					if (!hasSubstantiveOutput && isAdaptiveTransientTransport(error)) {
-						if (await waitForTransportRetry(error)) continue;
+					const retryKind = isAdaptiveRateLimit(error)
+						? "rate-limit"
+						: isAdaptiveTransientTransport(error)
+							? "transport"
+							: undefined;
+					if (!hasSubstantiveOutput && retryKind !== undefined) {
+						if (await waitForRetry(error, retryKind)) continue;
 					}
 					flushReplaySafeEvents();
 					throw error;

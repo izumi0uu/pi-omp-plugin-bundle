@@ -23,7 +23,6 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				requestOptions: options,
 				queue,
 				maxRetries: 50,
-				maxTransportRetries: 3,
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: () =>
 					streamSimple(

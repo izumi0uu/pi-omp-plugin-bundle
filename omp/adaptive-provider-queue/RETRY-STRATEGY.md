@@ -1,14 +1,14 @@
 # OMP Provider Retry And Fallback Strategy
 
-记录日期：2026-08-10。当前验证版本：OMP 17.2.12。
+记录日期：2026-08-11。当前验证版本：OMP 17.2.12。
 
 ## 目标
 
 - 正常请求不设置固定并发上限。
-- 只有真实请求返回 pre-content 并发或限流错误时才进入 FIFO 队列。
+- 真实请求返回限流或可恢复的传输错误时才进入 FIFO 队列。
 - `502`、`503`、鉴权、额度和模型不可用错误不消耗 50 次队列预算。
-- pre-content 的 `stream_read_error` 和连接断开先进行 3 次短重试，避免单次断流
-  立即触发 fallback。
+- `stream_read_error`、超时、连接断开和不完整流与限流共享 50 次预算，避免瞬时
+  传输波动过早触发 fallback。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
 - fallback 失败后保留冷却，避免无限来回切换；同时提供一次有界的原生 transport 尝试。
 
@@ -23,14 +23,14 @@ modelRoles:
   perplexity: tokenking-grok-queued/grok-4.5:high
 ```
 
-`default`、`slow` 和 `plan` 都使用 adaptive queue transport。主模型遇到
-pre-content 并发或限流错误时会执行 50 次分段重试；遇到 `502`、`503`、鉴权、
-额度或模型不可用错误时才立即进入 fallback。手动选择普通 `aiinput` 会绕过这套
-内部队列并采用 fail-fast 行为，两者不会自动互换。
+`default`、`slow` 和 `plan` 都使用 adaptive queue transport。主模型在输出正文、
+tool call 或图片前遇到限流或可恢复传输错误时，会执行同一套 50 次分段重试；遇到
+`502`、`503`、鉴权、额度或模型不可用错误时才立即进入 fallback。手动选择普通
+`aiinput` 会绕过这套内部队列并采用 fail-fast 行为，两者不会自动互换。
 
 ## 重试归属
 
-OMP 全局重试关闭，插件单独拥有并发限流重试：
+OMP 全局重试关闭，插件单独拥有可恢复错误重试：
 
 ```yaml
 retry:
@@ -47,31 +47,21 @@ retry:
 | 31-40 | 每次 3 分钟 |
 | 41-50 | 每次 5 分钟封顶 |
 
-传输层错误使用独立的小预算，不进入上述 50 次限流预算：
-
-| 传输重试编号 | 等待 |
-|---|---|
-| 1 | 2 秒 |
-| 2 | 4 秒 |
-| 3 | 8 秒 |
-| 3 次后 | 将最后一次错误交给 OMP fallback |
-
-传输重试单次最多等待 15 秒。只有 thinking 的流可以重试，后续尝试会抑制重复的
-thinking 和 stream envelope；一旦已经输出正文、tool call 或图片，就不重放。
-
-这 50 次只适用于尚未产生实质内容的并发或限流错误。手动取消会立即中断等待。
+限流和可恢复传输错误共享同一个计数器，不会分别获得两套预算。只有 thinking 的流
+仍可重试，后续尝试会抑制重复的 thinking 和 stream envelope；一旦已经输出正文、
+tool call 或图片，就不重放。手动取消会立即中断等待。
 
 ## 错误路由
 
 | 错误 | 行为 |
 |---|---|
-| Pre-content `429`、concurrency、rate limit | queued provider 排队并分段重试 |
-| Pre-content `stream_read_error`、socket reset、fetch/network failure | 先短重试 3 次，再交给 OMP fallback |
+| 输出正文/tool/image 前的 `429`、concurrency、rate limit | 排队并使用共享 50 次预算 |
+| 输出正文/tool/image 前的 `stream_read_error`、timeout、socket/fetch/network failure、不完整流 | 排队并使用共享 50 次预算 |
 | `401`、`403`、token revoked | 立即交给 OMP fallback |
 | quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
 | model unavailable、no capacity、`502`、`503` | 立即交给 OMP fallback |
 | 已产生文本、tool call 或图片后的错误 | 不重放，直接结束当前流 |
-| queued provider 的第 50 次仍限流 | 把最后一次错误交给 OMP fallback |
+| queued provider 的第 50 次可恢复错误仍失败 | 把最后一次错误交给 OMP fallback |
 
 ## Fallback Chain
 
