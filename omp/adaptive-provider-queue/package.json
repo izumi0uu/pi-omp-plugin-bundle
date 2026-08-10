@@ -1,6 +1,6 @@
 {
   "name": "omp-adaptive-provider-queue",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Adaptive cross-process queue for transient provider concurrency limits in Oh My Pi",
   "repository": {
@@ -20,6 +20,7 @@
     "examples",
     ".env.example",
     "README.md",
+    "RETRY-STRATEGY.md",
     "CHANGELOG.md"
   ],
   "keywords": [

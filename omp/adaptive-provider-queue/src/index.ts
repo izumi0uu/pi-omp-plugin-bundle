@@ -9,7 +9,10 @@ import { toOpenAIResponsesModel } from "./responses-model.ts";
 import { createAdaptiveStream } from "./stream-wrapper.ts";
 
 const QUEUED_RESPONSES_API = "adaptive-queued-openai-responses" as Api;
-const queue = new AdaptiveProviderQueue();
+const queue = new AdaptiveProviderQueue({
+	baseDelayMs: 500,
+	maxDelayMs: 300_000,
+});
 
 export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	pi.registerProvider("adaptive-provider-queue", {
@@ -19,6 +22,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				model,
 				requestOptions: options,
 				queue,
+				maxRetries: 50,
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: () =>
 					streamSimple(
@@ -38,6 +42,40 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			{
 				id: "gpt-5.6-sol",
 				name: "GPT 5.6 Sol (AI Input, adaptive queue)",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 372_000,
+				maxTokens: 32_768,
+			},
+		],
+	});
+
+	pi.registerProvider("aiinput-overseas-queued", {
+		baseUrl: "https://input.codes/v1",
+		apiKey: "AIINPUT_API_KEY",
+		api: QUEUED_RESPONSES_API,
+		models: [
+			{
+				id: "gpt-5.6-sol",
+				name: "GPT 5.6 Sol (AI Input overseas, adaptive queue)",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 372_000,
+				maxTokens: 32_768,
+			},
+		],
+	});
+
+	pi.registerProvider("tokenking-queued", {
+		baseUrl: "https://api.tokenskingdom.com/v1",
+		apiKey: "TOKENKING_API_KEY",
+		api: QUEUED_RESPONSES_API,
+		models: [
+			{
+				id: "gpt-5.6-sol",
+				name: "GPT 5.6 Sol (TokenKing, adaptive queue)",
 				reasoning: true,
 				input: ["text", "image"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

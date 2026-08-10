@@ -9,9 +9,35 @@ OMP request
   -> send immediately when no backlog exists
   -> pre-content transient 429
   -> join credential-scoped FIFO lane
-  -> retry with exponential backoff
+  -> retry up to 50 times with staged backoff
   -> release lane after the whole stream terminates
 ```
+
+Retry pacing is deliberately staged so a temporary provider limit does not
+turn into a rapid retry storm:
+
+| Retry number | Delay policy |
+|---|---|
+| 1-10 | Existing exponential backoff (500 ms base, 30 s first-stage cap) |
+| 11-20 | 1 minute |
+| 21-30 | 2 minutes |
+| 31-40 | 3 minutes |
+| 41-50 | 5 minutes maximum |
+| After 50 | Forward the last rate-limit error to OMP fallback |
+
+A small positive jitter remains on staged delays to avoid synchronized retries,
+but no wait can exceed five minutes. Cancellation interrupts a pending wait.
+
+Set OMP's global `retry.maxRetries` to `0`, as shown in
+[`examples/config.yml`](examples/config.yml). The extension owns transient
+concurrency retries; disabling the outer retry loop prevents a fallback model's
+502/503 response from starting a second retry budget. `retry.modelFallback`
+remains enabled, so non-retryable failures can still traverse the configured
+fallback chain once.
+
+The current operational policy, exact failure-domain boundaries, fallback
+cooldown behavior and diagnostic commands are recorded in
+[`RETRY-STRATEGY.md`](RETRY-STRATEGY.md).
 
 | Failure | Action |
 |---|---|
@@ -26,6 +52,8 @@ OMP request
 | Provider | Endpoint | Model | Credential variable |
 |---|---|---|---|
 | `aiinput-queued` | `https://ai.input.im/v1` | `gpt-5.6-sol` | `AIINPUT_API_KEY` |
+| `aiinput-overseas-queued` | `https://input.codes/v1` | `gpt-5.6-sol` | `AIINPUT_API_KEY` |
+| `tokenking-queued` | `https://api.tokenskingdom.com/v1` | `gpt-5.6-sol` | `TOKENKING_API_KEY` |
 | `tokenking-grok-queued` | `https://api.tokenskingdom.com/v1` | `grok-4.5` | `TOKENKING_GROK_API_KEY` |
 
 No API key is stored in queue metadata. The lane identity hashes endpoint origin and credential scope with SHA-256.
@@ -60,6 +88,7 @@ Set credentials in OMP's private environment file:
 
 ```dotenv
 AIINPUT_API_KEY=your-key
+TOKENKING_API_KEY=your-key
 TOKENKING_GROK_API_KEY=your-key
 ```
 

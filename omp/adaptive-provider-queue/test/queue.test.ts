@@ -48,6 +48,29 @@ test("retry-after hints are parsed without turning quota errors into queue waits
 	assert.equal(retryAfterMsFromError({ errorMessage: "try again in 750ms" }), 750);
 });
 
+test("retry backoff uses ten-attempt stages and caps every wait at five minutes", () => {
+	const queue = new AdaptiveProviderQueue({ baseDelayMs: 2_000, maxDelayMs: 300_000, random: () => 0 });
+	const expected = new Map([
+		[1, 2_000],
+		[2, 4_000],
+		[3, 8_000],
+		[4, 16_000],
+		[5, 30_000],
+		[10, 30_000],
+		[11, 60_000],
+		[20, 60_000],
+		[21, 120_000],
+		[30, 120_000],
+		[31, 180_000],
+		[40, 180_000],
+		[41, 300_000],
+		[50, 300_000],
+	]);
+	for (const [attempt, delay] of expected) assert.equal(queue.backoffDelayMs(attempt), delay);
+	assert.equal(queue.backoffDelayMs(1, 900_000), 300_000);
+	assert.equal(new AdaptiveProviderQueue({ baseDelayMs: 2_000, maxDelayMs: 300_000, random: () => 1 }).backoffDelayMs(41), 300_000);
+});
+
 test("queued custom models regain Responses compat without downgrading reasoning effort", () => {
 	const source = {
 		provider: "aiinput-queued",
@@ -207,6 +230,31 @@ test("stream wrapper discards pre-content 429 attempts and emits only the succes
 	await output.completion.promise;
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 	assert.equal(attempts.length, 0);
+});
+
+test("stream wrapper forwards the last rate-limit error after the retry budget", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([
+				{ type: "start", partial: assistant() },
+				{ type: "text_start", contentIndex: 0, partial: assistant() },
+				{ type: "error", reason: "error", error: failed },
+			]);
+		},
+	});
+	await output.completion.promise;
+	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error, failed);
 });
 
 test("stream wrapper never replays a rate limit after substantive content", async () => {

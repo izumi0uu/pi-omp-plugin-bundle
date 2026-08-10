@@ -24,7 +24,10 @@ export interface AdaptiveQueueOptions {
 const DEFAULT_POLL_MS = 250;
 const DEFAULT_STALE_MS = 60_000;
 const DEFAULT_BASE_DELAY_MS = 2_000;
-const DEFAULT_MAX_DELAY_MS = 30_000;
+const DEFAULT_FIRST_STAGE_MAX_DELAY_MS = 30_000;
+const DEFAULT_MAX_DELAY_MS = 300_000;
+const RETRY_STAGE_SIZE = 10;
+const RETRY_STAGE_DELAYS_MS = [60_000, 120_000, 180_000, 300_000] as const;
 const HEARTBEAT_DIVISOR = 3;
 
 let ticketSequence = 0;
@@ -189,12 +192,27 @@ export class AdaptiveProviderQueue {
 	}
 
 	backoffDelayMs(attempt: number, retryAfterMs?: number): number {
-		const exponent = Math.max(0, Math.min(20, attempt - 1));
-		const exponential = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** exponent);
+		const retryNumber = Math.max(1, Math.floor(attempt));
+		const exponential =
+			retryNumber <= RETRY_STAGE_SIZE
+				? Math.min(
+						this.maxDelayMs,
+						DEFAULT_FIRST_STAGE_MAX_DELAY_MS,
+						this.baseDelayMs * 2 ** Math.min(20, retryNumber - 1),
+					)
+				: Math.min(
+						this.maxDelayMs,
+						RETRY_STAGE_DELAYS_MS[
+							Math.min(
+								RETRY_STAGE_DELAYS_MS.length - 1,
+								Math.floor((retryNumber - RETRY_STAGE_SIZE - 1) / RETRY_STAGE_SIZE),
+							)
+						],
+					);
 		const serverDelay = retryAfterMs === undefined ? 0 : Math.max(0, retryAfterMs);
-		const baseline = Math.max(exponential, serverDelay);
+		const baseline = Math.min(this.maxDelayMs, Math.max(exponential, serverDelay));
 		const jitter = baseline === 0 ? 0 : Math.floor(baseline * 0.2 * this.random());
-		return baseline + jitter;
+		return Math.min(this.maxDelayMs, baseline + jitter);
 	}
 
 	async defer(attempt: number, retryAfterMs: number | undefined, signal?: AbortSignal): Promise<number> {

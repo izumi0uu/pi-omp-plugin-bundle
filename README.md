@@ -61,7 +61,7 @@ omp plugin uninstall omp-pi-tool-display
 omp plugin install github:izumi0uu/pi-omp-plugin-bundle#COMMIT_OR_TAG
 ```
 
-同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 provider 或工具。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
+同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 provider 或工具。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md)、[`omp/adaptive-provider-queue/RETRY-STRATEGY.md`](omp/adaptive-provider-queue/RETRY-STRATEGY.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
 
 `perplexity` 是窗口专用的 model role，不是插件或 task agent。安装配置和启动器后直接打开搜索窗口：
 

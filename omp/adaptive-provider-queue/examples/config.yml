@@ -3,7 +3,18 @@ modelRoles:
   research: tokenking-grok-queued/grok-4.5:high
 
 retry:
+  # The extension owns transient concurrency retries. Keep OMP's outer retry
+  # loop disabled so 5xx failures can move through the fallback chain once.
+  maxRetries: 0
   modelFallback: true
+  fallbackRevertPolicy: cooldown-expiry
   fallbackChains:
+    aiinput-queued/*:
+      - tokenking-queued/gpt-5.6-sol:max
+      - tokenking/gpt-5.6-sol:max
+    aiinput/*:
+      - tokenking-queued/gpt-5.6-sol:max
+      - tokenking/gpt-5.6-sol:max
     tokenking-grok-queued/*:
-      - aiinput-queued/gpt-5.6-sol:max
+      - tokenking-queued/gpt-5.6-sol:max
+      - tokenking/gpt-5.6-sol:max

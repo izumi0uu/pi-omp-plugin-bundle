@@ -32,10 +32,13 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	model: { provider: string; id?: string; baseUrl?: string; [key: string]: unknown };
 	requestOptions?: { apiKey?: unknown; signal?: AbortSignal; [key: string]: unknown };
 	queue: AdaptiveProviderQueue;
+	maxRetries?: number;
 	createOutputStream(): TOutput;
 	createInputStream(): InputStreamLike;
 	logger?: QueueLogger;
 }
+
+export const DEFAULT_MAX_RETRIES = 50;
 
 const QUOTA_OR_BILLING_PATTERN =
 	/insufficient[_ -]?quota|quota (?:exceeded|exhausted)|resource[_ -]?exhausted|usage[_ -]?limit[_ -]?reached|billing|credit|balance|spend(?:ing)?[_ -]?limit|monthly[_ -]?limit|daily[_ -]?limit/i;
@@ -115,6 +118,7 @@ function isReplaySafeBoundary(event: StreamEventLike): boolean {
 export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: AdaptiveStreamOptions<TOutput>): TOutput {
 	const output = options.createOutputStream();
 	const signal = options.requestOptions?.signal;
+	const maxRetries = Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES));
 	const laneId = createLaneId({
 		provider: options.model.provider,
 		baseUrl: options.model.baseUrl,
@@ -146,6 +150,31 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					for (const event of replaySafeEvents) output.push(event);
 					replaySafeEvents.length = 0;
 				};
+				const waitForRateLimitRetry = async (error: unknown): Promise<boolean> => {
+					const retryNumber = rateLimitAttempt + 1;
+					if (retryNumber > maxRetries) {
+						options.logger?.warn?.("adaptive provider queue retry limit reached", {
+							provider: options.model.provider,
+							model: options.model.id,
+							attempt: rateLimitAttempt,
+							maxRetries,
+						});
+						return false;
+					}
+					rateLimitAttempt = retryNumber;
+					ticket ??= await options.queue.acquire(laneId);
+					const retryAfterMs = retryAfterMsFromError(error);
+					const delayMs = options.queue.backoffDelayMs(retryNumber, retryAfterMs);
+					options.logger?.warn?.("adaptive provider queue caught transient rate limit", {
+						provider: options.model.provider,
+						model: options.model.id,
+						attempt: retryNumber,
+						maxRetries,
+						delayMs,
+					});
+					await sleepWithSignal(delayMs, signal);
+					return true;
+				};
 
 				try {
 					const input = options.createInputStream();
@@ -161,19 +190,14 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							!semanticContentExists(event.error) &&
 							isAdaptiveRateLimit(event.error)
 						) {
-							rateLimitAttempt += 1;
-							ticket ??= await options.queue.acquire(laneId);
-							const retryAfterMs = retryAfterMsFromError(event.error);
-							const delayMs = options.queue.backoffDelayMs(rateLimitAttempt, retryAfterMs);
-							options.logger?.warn?.("adaptive provider queue caught transient rate limit", {
-								provider: options.model.provider,
-								model: options.model.id,
-								attempt: rateLimitAttempt,
-								delayMs,
-							});
-							await sleepWithSignal(delayMs, signal);
-							retry = true;
-							break;
+							if (await waitForRateLimitRetry(event.error)) {
+								retry = true;
+								break;
+							}
+							flushReplaySafeEvents();
+							output.push(event);
+							ticket = await releaseTicket(options.queue, ticket);
+							return;
 						}
 
 						flushReplaySafeEvents();
@@ -194,12 +218,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					}
 				} catch (error) {
 					if (!replayUnsafe && isAdaptiveRateLimit(error)) {
-						rateLimitAttempt += 1;
-						ticket ??= await options.queue.acquire(laneId);
-						const retryAfterMs = retryAfterMsFromError(error);
-						const delayMs = options.queue.backoffDelayMs(rateLimitAttempt, retryAfterMs);
-						await sleepWithSignal(delayMs, signal);
-						continue;
+						if (await waitForRateLimitRetry(error)) continue;
 					}
 					flushReplaySafeEvents();
 					throw error;
