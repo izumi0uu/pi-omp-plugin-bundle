@@ -14,16 +14,17 @@
 
 ```yaml
 modelRoles:
-  default: aiinput/gpt-5.6-sol:max
+  default: aiinput-queued/gpt-5.6-sol:max
   slow: aiinput-queued/gpt-5.6-sol:max
   plan: aiinput-queued/gpt-5.6-sol:max
   research: tokenking-grok-queued/grok-4.5:high
   perplexity: tokenking-grok-queued/grok-4.5:high
 ```
 
-`default` 使用普通 AI Input transport，因此快速失败并进入 fallback。`slow` 和
-`plan` 才使用 50 次分段限流重试。选择模型时必须区分 `aiinput` 与
-`aiinput-queued`，两者不会自动互换。
+`default`、`slow` 和 `plan` 都使用 adaptive queue transport。主模型遇到
+pre-content 并发或限流错误时会执行 50 次分段重试；遇到 `502`、`503`、鉴权、
+额度或模型不可用错误时才立即进入 fallback。手动选择普通 `aiinput` 会绕过这套
+内部队列并采用 fail-fast 行为，两者不会自动互换。
 
 ## 重试归属
 
