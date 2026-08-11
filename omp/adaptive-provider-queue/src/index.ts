@@ -16,6 +16,13 @@ import {
 } from "./kimi-config.ts";
 import { AdaptiveProviderQueue } from "./queue.ts";
 import { toOpenAIResponsesModel } from "./responses-model.ts";
+import {
+	ADAPTIVE_5XX_POLICY_ENTRY,
+	DEFAULT_TRANSIENT_UPSTREAM_MODE,
+	parseTransientUpstreamModeCommand,
+	transientUpstreamModeFromEntries,
+	type TransientUpstreamMode,
+} from "./session-policy.ts";
 import { createAdaptiveStream } from "./stream-wrapper.ts";
 
 const QUEUED_RESPONSES_API = "adaptive-queued-openai-responses" as Api;
@@ -32,6 +39,50 @@ const queue = new AdaptiveProviderQueue({
 });
 
 export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
+	let transientUpstreamMode: TransientUpstreamMode = DEFAULT_TRANSIENT_UPSTREAM_MODE;
+	type SessionContextLike = {
+		hasUI?: boolean;
+		ui?: { notify?(message: string, type?: "info" | "warning" | "error"): void; setStatus?(key: string, text: string | undefined): void };
+		sessionManager?: { getBranch?(): unknown[]; appendCustomEntry?(customType: string, data?: unknown): string };
+	};
+	const updateStatus = (ctx: SessionContextLike) => {
+		ctx.ui?.setStatus?.(
+			"adaptive-provider-queue:5xx",
+			transientUpstreamMode === "fallback" ? "5xx: immediate fallback" : undefined,
+		);
+	};
+	const restoreSessionPolicy = (ctx: SessionContextLike) => {
+		if (ctx.hasUI === false) return;
+		transientUpstreamMode = transientUpstreamModeFromEntries(ctx.sessionManager?.getBranch?.() ?? []);
+		updateStatus(ctx);
+	};
+	const streamOptions = () => ({ retryTransientUpstream5xx: transientUpstreamMode === "retry" });
+
+	pi.registerCommand("adaptive-5xx", {
+		description: "Choose whether generic 502/503/504 errors retry or immediately fall back in this session",
+		handler: (args, ctx) => {
+			const command = parseTransientUpstreamModeCommand(args, transientUpstreamMode);
+			if (!command) {
+				ctx.ui.notify("Usage: /adaptive-5xx [status|retry|fallback|toggle]", "warning");
+				return;
+			}
+			if (command !== "status") {
+				transientUpstreamMode = command;
+				ctx.sessionManager.appendCustomEntry(ADAPTIVE_5XX_POLICY_ENTRY, { mode: command });
+				updateStatus(ctx);
+			}
+			ctx.ui.notify(
+				transientUpstreamMode === "retry"
+					? "Generic 502/503/504 errors will use the shared 50-attempt retry campaign in this session."
+					: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
+				"info",
+			);
+		},
+	});
+	pi.on("session_start", (_event, ctx) => restoreSessionPolicy(ctx));
+	pi.on("session_switch", (_event, ctx) => restoreSessionPolicy(ctx));
+	pi.on("session_branch", (_event, ctx) => restoreSessionPolicy(ctx));
+
 	pi.registerProvider("adaptive-provider-queue", {
 		api: QUEUED_RESPONSES_API,
 		streamSimple: (model, context, options) =>
@@ -40,6 +91,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				requestOptions: options,
 				queue,
 				maxRetries: 50,
+				...streamOptions(),
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: () =>
 					streamSimple(
@@ -129,6 +181,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				requestOptions: options,
 				queue,
 				maxRetries: 50,
+				...streamOptions(),
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: () => {
 					const canonicalModel = getModel("kimi-code", model.id);

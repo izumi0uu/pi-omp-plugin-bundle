@@ -33,6 +33,7 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	requestOptions?: { apiKey?: unknown; signal?: AbortSignal; [key: string]: unknown };
 	queue: AdaptiveProviderQueue;
 	maxRetries?: number;
+	retryTransientUpstream5xx?: boolean;
 	createOutputStream(): TOutput;
 	createInputStream(): InputStreamLike;
 	logger?: QueueLogger;
@@ -107,10 +108,19 @@ export function isAdaptiveTransientTransport(error: unknown): boolean {
 	const text = errorText(error);
 	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
 	const status = errorStatus(error);
-	if (status !== undefined && !TRANSIENT_UPSTREAM_STATUSES.has(status)) return false;
+	if (status !== undefined) return false;
 	if (isAdaptiveRateLimit(error)) return false;
-	if (status !== undefined) return true;
 	return TRANSIENT_TRANSPORT_PATTERN.test(text);
+}
+
+export function isAdaptiveTransientUpstream(error: unknown): boolean {
+	const text = errorText(error);
+	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
+	return TRANSIENT_UPSTREAM_STATUSES.has(errorStatus(error) ?? 0) && !isAdaptiveRateLimit(error);
+}
+
+function transientUpstreamStatus(error: unknown): number | undefined {
+	return isAdaptiveTransientUpstream(error) ? errorStatus(error) : undefined;
 }
 
 export function retryAfterMsFromError(error: unknown): number | undefined {
@@ -168,6 +178,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 	const output = options.createOutputStream();
 	const signal = options.requestOptions?.signal;
 	const maxRetries = Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES));
+	const retryTransientUpstream5xx = options.retryTransientUpstream5xx ?? true;
 	const laneId = createLaneId({
 		provider: options.model.provider,
 		baseUrl: options.model.baseUrl,
@@ -181,11 +192,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		let emittedTextStart = false;
 		let emittedThinking = false;
 		try {
-			const [hasWaiters, hasRetryState] = await Promise.all([
+			const [hasWaiters, retryState] = await Promise.all([
 				options.queue.hasWaiters(laneId),
-				options.queue.hasRetryState(laneId),
+				options.queue.getRetryState(laneId),
 			]);
-			if (hasWaiters || hasRetryState) {
+			const bypassActiveUpstreamCampaign =
+				!retryTransientUpstream5xx &&
+				retryState?.status === "active" &&
+				TRANSIENT_UPSTREAM_STATUSES.has(retryState.lastStatus ?? 0);
+			if (!bypassActiveUpstreamCampaign && (hasWaiters || retryState)) {
 				ticket = await options.queue.acquire(laneId);
 			}
 
@@ -240,6 +255,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					for (const event of replaySafeEvents) pushEvent(event);
 					replaySafeEvents.length = 0;
 				};
+				const retryKind = (error: unknown): "rate-limit" | "transport" | undefined => {
+					if (isAdaptiveRateLimit(error)) return "rate-limit";
+					if (isAdaptiveTransientUpstream(error)) {
+						return retryTransientUpstream5xx ? "transport" : undefined;
+					}
+					return isAdaptiveTransientTransport(error) ? "transport" : undefined;
+				};
+				const bypassesUpstreamRetry = (error: unknown): boolean =>
+					!retryTransientUpstream5xx && isAdaptiveTransientUpstream(error);
 				const waitForRetry = async (error: unknown, kind: "rate-limit" | "transport"): Promise<boolean> => {
 					let joinedBehindAnotherRequest = false;
 					if (!ticket) {
@@ -275,6 +299,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						maxRetries,
 						retryAfterMs,
 						kind,
+						status: transientUpstreamStatus(error),
 					});
 					if (decision.status === "exhausted") {
 						options.logger?.warn?.("adaptive provider queue retry limit reached", {
@@ -310,19 +335,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						}
 
 						const cancelled = event.type === "error" && isCancellation(event.error, signal);
-						const retryKind = isAdaptiveRateLimit(event.error)
-							? "rate-limit"
-							: isAdaptiveTransientTransport(event.error)
-								? "transport"
-								: undefined;
+						const kind = retryKind(event.error);
 						if (
 							event.type === "error" &&
 							!cancelled &&
 							!hasSubstantiveOutput &&
 							!substantiveContentExists(event.error) &&
-							retryKind !== undefined
+							kind !== undefined
 						) {
-							if (await waitForRetry(event.error, retryKind)) {
+							if (await waitForRetry(event.error, kind)) {
 								retry = true;
 								break;
 							}
@@ -339,7 +360,12 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						if (eventHasSubstantiveOutput || substantiveContentExists(event.error)) {
 							await options.queue.clearRetryState(ticket);
 							ticket = await releaseTicket(options.queue, ticket);
-						} else if (event.type === "error" && !cancelled && ticket) {
+						} else if (
+							event.type === "error" &&
+							!cancelled &&
+							ticket &&
+							!bypassesUpstreamRetry(event.error)
+						) {
 							await options.queue.markRetryStateExhausted(ticket);
 						}
 						if (event.type === "done" || event.type === "error") {
@@ -359,16 +385,12 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					}
 				} catch (error) {
 					const cancelled = isCancellation(error, signal);
-					const retryKind = isAdaptiveRateLimit(error)
-						? "rate-limit"
-						: isAdaptiveTransientTransport(error)
-							? "transport"
-							: undefined;
-					if (!cancelled && !hasSubstantiveOutput && retryKind !== undefined) {
-						if (await waitForRetry(error, retryKind)) continue;
+					const kind = retryKind(error);
+					if (!cancelled && !hasSubstantiveOutput && kind !== undefined) {
+						if (await waitForRetry(error, kind)) continue;
 					}
 					flushReplaySafeEvents();
-					if (!hasSubstantiveOutput && !cancelled && ticket) {
+					if (!hasSubstantiveOutput && !cancelled && ticket && !bypassesUpstreamRetry(error)) {
 						await options.queue.markRetryStateExhausted(ticket);
 					}
 					throw error;

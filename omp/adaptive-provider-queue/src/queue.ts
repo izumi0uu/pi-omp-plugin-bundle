@@ -34,6 +34,7 @@ export interface LaneRetryState {
 	readonly updatedAt: number;
 	readonly expiresAt: number;
 	readonly lastKind: RetryFailureKind | "terminal";
+	readonly lastStatus?: number;
 }
 
 export type RetryFailureDecision =
@@ -173,6 +174,7 @@ export class AdaptiveProviderQueue {
 		if (typeof candidate.updatedAt !== "number" || !Number.isFinite(candidate.updatedAt)) return undefined;
 		if (typeof candidate.expiresAt !== "number" || !Number.isFinite(candidate.expiresAt)) return undefined;
 		if (candidate.lastKind !== "rate-limit" && candidate.lastKind !== "transport" && candidate.lastKind !== "terminal") return undefined;
+		if (candidate.lastStatus !== undefined && (typeof candidate.lastStatus !== "number" || !Number.isInteger(candidate.lastStatus))) return undefined;
 		return candidate as unknown as LaneRetryState;
 	}
 
@@ -336,7 +338,7 @@ export class AdaptiveProviderQueue {
 
 	async recordRetryFailure(
 		ticket: QueueTicket,
-		options: { maxRetries: number; retryAfterMs?: number; kind: RetryFailureKind },
+		options: { maxRetries: number; retryAfterMs?: number; kind: RetryFailureKind; status?: number },
 	): Promise<RetryFailureDecision> {
 		await this.assertFront(ticket);
 		const existing = await this.readRetryState(ticket.laneId);
@@ -360,6 +362,7 @@ export class AdaptiveProviderQueue {
 				updatedAt: now,
 				expiresAt: now + this.retryStateTtlMs,
 				lastKind: options.kind,
+				lastStatus: options.status,
 			});
 			return { status: "exhausted", attempt, maxRetries };
 		}
@@ -376,6 +379,7 @@ export class AdaptiveProviderQueue {
 			updatedAt: now,
 			expiresAt: nextRetryAt + this.retryStateTtlMs,
 			lastKind: options.kind,
+			lastStatus: options.status,
 		});
 		return { status: "retry", attempt: retryNumber, maxRetries, delayMs };
 	}

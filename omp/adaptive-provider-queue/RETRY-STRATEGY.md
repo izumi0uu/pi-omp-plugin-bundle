@@ -9,6 +9,8 @@
 - 临时上游 `502/503/504`、`server_is_overloaded`、`stream_read_error`、超时、连接断开和不完整流与限流共享
   50 次预算；同一 endpoint + credential lane 的所有窗口共享这一份预算，避免瞬时服务
   拥塞或传输波动过早触发 fallback。
+- 允许单个 session 把普通 HTTP `502/503/504` 改为首次失败后立即进入 OMP fallback，
+  不改变并发限流、明确服务器过载、断流、鉴权、额度和模型不可用的既有路由。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
 - fallback 失败后保留冷却，避免无限来回切换；同时提供一次有界的原生 transport 尝试。
 
@@ -53,6 +55,29 @@ retry:
 仍可重试，后续尝试会抑制重复的 thinking 和 stream envelope；一旦已经输出正文、
 tool call 或图片，就不重放。手动取消会立即中断等待，但不会清空正在恢复的 lane 状态。
 
+### Session 级普通 5xx 开关
+
+```text
+/adaptive-5xx status
+/adaptive-5xx retry
+/adaptive-5xx fallback
+/adaptive-5xx toggle
+```
+
+- 新 session 默认为 `retry`，普通 `502/503/504` 使用共享 50 次预算。
+- `fallback` 模式下，普通 `502/503/504` 的首次失败直接交给 OMP fallback。
+- 选择写入当前 session JSONL；`/resume` 会恢复。fork 的活动分支包含该记录时会继承。
+- `/new` 没有旧记录，因此回到默认 `retry`。
+- root session 创建的 subagent 沿用 root 当前模式。
+- `fallback` 模式激活时，状态栏显示 `5xx: immediate fallback`。
+- 开关不影响明确的 concurrency/rate limit、`server_is_overloaded`、
+  `stream_read_error`、无 HTTP 状态的 timeout/socket/network failure；这些仍重试。
+- 开关也不影响鉴权、额度、billing、明确 model unavailable；这些仍立即交给 fallback。
+
+如果同一 endpoint + credential lane 的其他窗口正在执行普通 5xx 恢复活动，
+`fallback` session 不加入这份活动，也不会把它标记为 `exhausted`。它独立请求一次，
+若仍得到普通 5xx，就只让当前 session 进入 OMP fallback。
+
 ### 跨窗口恢复状态
 
 - 健康 lane 不限制初始并发；只有真实请求失败后才创建共享恢复状态。
@@ -68,7 +93,9 @@ tool call 或图片，就不重放。手动取消会立即中断等待，但不�
 | 错误 | 行为 |
 |---|---|
 | 输出正文/tool/image 前的 `429`、concurrency、rate limit | 排队并使用共享 50 次预算 |
-| 临时上游 `502/503/504`，包括明确的 `server_is_overloaded` 同义响应 | 排队并使用共享 50 次预算 |
+| 普通上游 `502/503/504`，session 为默认 `retry` | 排队并使用共享 50 次预算 |
+| 普通上游 `502/503/504`，session 为 `fallback` | 首次失败直接交给 OMP fallback |
+| 明确的 `server_is_overloaded` 同义响应 | 两种 session 模式都排队并使用共享 50 次预算 |
 | 输出正文/tool/image 前的 `stream_read_error`、timeout、socket/fetch/network failure、不完整流 | 排队并使用共享 50 次预算 |
 | `401`、`403`、token revoked | 立即交给 OMP fallback |
 | quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
@@ -163,6 +190,12 @@ omp config get retry.fallbackChains --json
 omp models aiinput-queued --json
 omp models tokenking-queued --json
 omp models kimi-code-queued --json
+```
+
+在 OMP session 内检查当前普通 5xx 策略：
+
+```text
+/adaptive-5xx status
 ```
 
 预期结果：

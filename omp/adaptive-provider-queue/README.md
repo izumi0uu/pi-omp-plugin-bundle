@@ -21,6 +21,28 @@ and use the same pacing. Thinking-only output may be retried without duplicating
 thinking block; once text, a tool call or an image has been emitted, the stream
 is never replayed.
 
+Generic HTTP `502/503/504` handling can be changed for the current session:
+
+```text
+/adaptive-5xx status
+/adaptive-5xx retry
+/adaptive-5xx fallback
+/adaptive-5xx toggle
+```
+
+New sessions default to `retry`. `fallback` forwards a generic `502/503/504`
+after the first failed request so OMP can traverse its model fallback chain.
+The choice is stored in the session, restored by `/resume`, and inherited by a
+fork whose active branch contains the policy entry. The status bar displays
+`5xx: immediate fallback` while `fallback` is active. Subagents created by the
+session use the root session's current choice.
+
+This switch is intentionally narrow. Explicit concurrency/rate-limit or
+`server_is_overloaded` failures, status-less transport failures and
+`stream_read_error` still use the shared retry campaign in both modes.
+Authentication, quota, billing and explicit model-unavailable failures still
+pass through immediately in both modes.
+
 Retry pacing is deliberately staged so a temporary provider limit does not
 turn into a rapid retry storm:
 
@@ -57,7 +79,9 @@ cooldown behavior and diagnostic commands are recorded in
 | Failure | Action |
 |---|---|
 | Concurrency/rate-limit 429 before text/tool/image | Queue and retry, shared 50-attempt budget |
-| Temporary upstream `502/503/504`, including explicit server overload | Queue and retry, shared 50-attempt budget |
+| Generic upstream `502/503/504` in the default session mode | Queue and retry, shared 50-attempt budget |
+| Generic upstream `502/503/504` after `/adaptive-5xx fallback` | Forward to OMP fallback after one request |
+| Explicit server overload | Queue and retry, shared 50-attempt budget in either session mode |
 | Stream/connection transport error before text/tool/image | Queue and retry, shared 50-attempt budget |
 | 429 quota, credits or billing exhausted | Forward to OMP fallback |
 | 401/403 authentication failure | Forward to OMP fallback |
@@ -146,7 +170,7 @@ npm test
 npm run pack:check
 ```
 
-The tests cover error classification, retry-after parsing, Responses compatibility, Kimi credential and model adaptation, cancellation, stale ticket cleanup, replay boundaries, shared retry counters, exhaustion propagation, success clearing and owner takeover between separate processes.
+The tests cover error classification, session policy restoration, generic 5xx mode switching, retry-after parsing, Responses compatibility, Kimi credential and model adaptation, cancellation, stale ticket cleanup, replay boundaries, shared retry counters, exhaustion propagation, success clearing and owner takeover between separate processes.
 
 ## Compatibility
 
@@ -162,7 +186,8 @@ Tickets default to `~/.omp/run/adaptive-provider-queue/`. Lane directories are
 created with `0700`; ticket files use `0600`. Each endpoint + credential lane
 may also contain one `retry-state.json`, written as a mode-`0600` temporary file
 and atomically replaced. It records only active/exhausted status, shared attempt
-count, ticket owner, next retry, expiry and last failure kind. Raw credentials
+count, ticket owner, next retry, expiry, last failure kind and optional HTTP
+status. Raw credentials
 are never stored. Dead-process and stale tickets are removed during queue scans;
 the next FIFO head claims any still-active state.
 

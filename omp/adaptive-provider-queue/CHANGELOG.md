@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 - 2026-08-11
+
+- Add `/adaptive-5xx status|retry|fallback|toggle` to choose generic upstream
+  `502/503/504` handling for the current session. New sessions default to the
+  shared 50-attempt retry campaign; fallback mode forwards the first generic
+  upstream 5xx failure to OMP.
+- Persist the choice in session history so resume and branch history restore it,
+  expose fallback mode in the status bar, and keep root subagents on the active
+  root-session policy.
+- Keep explicit concurrency/rate-limit, server overload and status-less
+  transport failures retryable in either mode. Preserve immediate fallback for
+  authentication, quota, billing and explicit model-unavailable failures.
+- Record the optional HTTP status in shared retry state so fallback-mode
+  sessions can bypass an active generic-5xx campaign without exhausting or
+  corrupting the campaign used by other OMP windows.
+
 ## 0.3.1 - 2026-08-11
 
 - Treat generic upstream `502`, `503` and `504` responses before substantive
