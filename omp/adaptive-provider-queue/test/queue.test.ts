@@ -71,7 +71,11 @@ test("transient transport errors join the adaptive retry class", () => {
 	assert.equal(isAdaptiveTransientTransport(new Error("socket connection was closed unexpectedly")), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("OpenAI responses stream timed out while waiting for the first event")), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("responses stream ended without response.completed: missing_terminal")), true);
-	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "stream_read_error" }), false);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "Bad gateway" }), true);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), true);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 504, errorMessage: "Gateway timeout" }), true);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 500, errorMessage: "Internal server error" }), false);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "model unavailable" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorMessage: "model overloaded" }), false);
 });
 
@@ -377,6 +381,45 @@ test("successful substantive output clears a retry campaign inherited from anoth
 			]),
 	});
 	await output.completion.promise;
+	assert.equal(await probeQueue.getRetryState(laneId), undefined);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+});
+
+test("a generic 503 continues an inherited retry campaign instead of exhausting it at one of fifty", async () => {
+	const rootDir = await tempRoot();
+	const ownerQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const probeQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test" };
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	const owner = await ownerQueue.acquire(laneId);
+	await ownerQueue.waitForTurn(owner);
+	await ownerQueue.recordRetryFailure(owner, { maxRetries: 50, kind: "transport" });
+	await ownerQueue.release(owner);
+
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const attempts = [
+		new FakeInputStream([
+			{ type: "start", partial: assistant() },
+			{ type: "error", reason: "error", error: unavailable },
+		]),
+		new FakeInputStream([
+			{ type: "start", partial: succeeded },
+			{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+			{ type: "done", reason: "stop", message: succeeded },
+		]),
+	];
+	const output = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue: probeQueue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => attempts.shift()!,
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts.length, 0);
 	assert.equal(await probeQueue.getRetryState(laneId), undefined);
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 });

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - 2026-08-11
+
+- Treat generic upstream `502`, `503` and `504` responses before substantive
+  output as recoverable transport failures that consume the shared 50-attempt
+  budget. A temporary `503` can no longer mark a lane exhausted at `1/50` and
+  force concurrent OMP windows into fallback.
+- Preserve immediate fallback for authentication, quota, billing, explicit
+  model-unavailable and no-capacity failures.
+
 ## 0.3.0 - 2026-08-11
 
 - Register `kimi-code-queued` with adaptive queue transport for all seven Kimi

@@ -65,6 +65,7 @@ const EXPLICIT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit[_ -]?exceeded|rate limit exceeded/i;
 const TRANSIENT_TRANSPORT_PATTERN =
 	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
+const TRANSIENT_UPSTREAM_STATUSES = new Set([502, 503, 504]);
 
 function errorText(error: unknown): string {
 	if (typeof error === "string") return error;
@@ -105,7 +106,10 @@ export function isAdaptiveRateLimit(error: unknown): boolean {
 export function isAdaptiveTransientTransport(error: unknown): boolean {
 	const text = errorText(error);
 	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
-	if (errorStatus(error) !== undefined || isAdaptiveRateLimit(error)) return false;
+	const status = errorStatus(error);
+	if (status !== undefined && !TRANSIENT_UPSTREAM_STATUSES.has(status)) return false;
+	if (isAdaptiveRateLimit(error)) return false;
+	if (status !== undefined) return true;
 	return TRANSIENT_TRANSPORT_PATTERN.test(text);
 }
 

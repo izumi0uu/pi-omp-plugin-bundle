@@ -14,10 +14,10 @@ OMP request
   -> clear state and release the lane after recovery is observed
 ```
 
-Concurrency/rate-limit errors, explicit temporary server overloads and transient
-transport failures such as `stream_read_error`, timeouts, reset sockets,
-incomplete streams or failed fetches consume the same retry counter and use the
-same pacing. Thinking-only output may be retried without duplicating the
+Concurrency/rate-limit errors, temporary upstream `502/503/504` responses and
+transient transport failures such as `stream_read_error`, timeouts, reset
+sockets, incomplete streams or failed fetches consume the same retry counter
+and use the same pacing. Thinking-only output may be retried without duplicating the
 thinking block; once text, a tool call or an image has been emitted, the stream
 is never replayed.
 
@@ -57,11 +57,11 @@ cooldown behavior and diagnostic commands are recorded in
 | Failure | Action |
 |---|---|
 | Concurrency/rate-limit 429 before text/tool/image | Queue and retry, shared 50-attempt budget |
-| Explicit temporary server overload, including overload HTTP 503 | Queue and retry, shared 50-attempt budget |
+| Temporary upstream `502/503/504`, including explicit server overload | Queue and retry, shared 50-attempt budget |
 | Stream/connection transport error before text/tool/image | Queue and retry, shared 50-attempt budget |
 | 429 quota, credits or billing exhausted | Forward to OMP fallback |
 | 401/403 authentication failure | Forward to OMP fallback |
-| Model unavailable, no capacity or generic 5xx | Forward to OMP fallback |
+| Model unavailable, no capacity or other generic 5xx | Forward to OMP fallback |
 | Error after text, tool call or image output | Forward unchanged; never replay partial output |
 | 50th queued retry still fails | Forward to OMP fallback and cache lane exhaustion for five minutes |
 | New request while lane exhaustion is cached | Forward to OMP fallback without contacting upstream |
