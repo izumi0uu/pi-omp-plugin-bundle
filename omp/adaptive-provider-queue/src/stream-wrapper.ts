@@ -1,4 +1,11 @@
-import { AdaptiveProviderQueue, createLaneId, type QueueTicket, type RetryWindowDecision } from "./queue.ts";
+import {
+	AdaptiveProviderQueue,
+	createLaneId,
+	type LaneRetryState,
+	type QueueTicket,
+	type RetryAttemptEpoch,
+	type RetryWindowDecision,
+} from "./queue.ts";
 
 interface AssistantLike {
 	stopReason?: string;
@@ -98,10 +105,13 @@ export function isAdaptiveRateLimit(error: unknown): boolean {
 	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
 	const status = errorStatus(error);
 	if (TRANSIENT_SERVER_OVERLOAD_PATTERN.test(text)) {
-		return status === undefined || status === 429 || status === 503;
+		return status === undefined || status === 429 || TRANSIENT_UPSTREAM_STATUSES.has(status);
+	}
+	if (EXPLICIT_RATE_LIMIT_PATTERN.test(text)) {
+		return status === undefined || status === 429 || TRANSIENT_UPSTREAM_STATUSES.has(status);
 	}
 	if (status === 429) return text.length === 0 || TRANSIENT_RATE_LIMIT_PATTERN.test(text) || !/\b(?:401|403|5\d\d)\b/.test(text);
-	return status === undefined && EXPLICIT_RATE_LIMIT_PATTERN.test(text);
+	return false;
 }
 
 export function isAdaptiveTransientTransport(error: unknown): boolean {
@@ -187,6 +197,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 
 	void (async () => {
 		let ticket: QueueTicket | undefined;
+		let bypassedRetryState: LaneRetryState | undefined;
 		let replayCount = 0;
 		let emittedStart = false;
 		let emittedTextStart = false;
@@ -200,11 +211,20 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				!retryTransientUpstream5xx &&
 				retryState?.status === "active" &&
 				TRANSIENT_UPSTREAM_STATUSES.has(retryState.lastStatus ?? 0);
+			if (bypassActiveUpstreamCampaign) bypassedRetryState = retryState;
 			if (!bypassActiveUpstreamCampaign && (hasWaiters || retryState)) {
 				ticket = await options.queue.acquire(laneId);
 			}
+			const clearObservedRetryState = async () => {
+				if (ticket) {
+					await options.queue.clearRetryState(ticket);
+				} else if (bypassedRetryState) {
+					await options.queue.clearRetryStateSnapshot(laneId, bypassedRetryState);
+				}
+				bypassedRetryState = undefined;
+			};
 
-			const waitForFrontRetryWindow = async (): Promise<RetryWindowDecision> => {
+			const waitForFrontRetryWindow = async (attemptStartedAt?: RetryAttemptEpoch): Promise<RetryWindowDecision> => {
 				if (!ticket) return { status: "ready", claimed: false };
 				const queueDepth = await options.queue.waitForTurn(ticket, signal);
 				options.logger?.info?.("adaptive provider queue request reached front", {
@@ -212,7 +232,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					model: options.model.id,
 					queueDepth,
 				});
-				return options.queue.waitForRetryWindow(ticket, signal);
+				return options.queue.waitForRetryWindow(ticket, signal, attemptStartedAt);
 			};
 
 			const retryExhaustedError = (window: Extract<RetryWindowDecision, { status: "exhausted" }>) =>
@@ -264,14 +284,18 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				};
 				const bypassesUpstreamRetry = (error: unknown): boolean =>
 					!retryTransientUpstream5xx && isAdaptiveTransientUpstream(error);
-				const waitForRetry = async (error: unknown, kind: "rate-limit" | "transport"): Promise<boolean> => {
+				const waitForRetry = async (
+					error: unknown,
+					kind: "rate-limit" | "transport",
+					attemptStartedAt: RetryAttemptEpoch,
+				): Promise<boolean> => {
 					let joinedBehindAnotherRequest = false;
 					if (!ticket) {
 						ticket = await options.queue.acquire(laneId);
 						joinedBehindAnotherRequest = (await options.queue.position(ticket)) > 0;
 					}
 
-					const currentWindow = await waitForFrontRetryWindow();
+					const currentWindow = await waitForFrontRetryWindow(attemptStartedAt);
 					if (currentWindow.status === "exhausted") {
 						options.logger?.warn?.("adaptive provider queue shared retry budget is exhausted", {
 							provider: options.model.provider,
@@ -283,12 +307,17 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						return false;
 					}
 
-					if (currentWindow.claimed || (joinedBehindAnotherRequest && !currentWindow.state)) {
+					if (
+						currentWindow.claimed ||
+						currentWindow.recoveredSinceRequest ||
+						(joinedBehindAnotherRequest && !currentWindow.state)
+					) {
 						replayCount += 1;
 						options.logger?.info?.("adaptive provider queue discarded a stale concurrent failure", {
 							provider: options.model.provider,
 							model: options.model.id,
 							observedRecovery: !currentWindow.state,
+							recoveredSinceRequest: currentWindow.recoveredSinceRequest,
 							tookOverProbe: currentWindow.claimed,
 						});
 						return true;
@@ -326,6 +355,10 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					return true;
 				};
 
+				const attemptStartedAt: RetryAttemptEpoch = {
+					wallMs: Date.now(),
+					monotonicNs: process.hrtime.bigint(),
+				};
 				try {
 					const input = options.createInputStream();
 					for await (const event of input) {
@@ -343,7 +376,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							!substantiveContentExists(event.error) &&
 							kind !== undefined
 						) {
-							if (await waitForRetry(event.error, kind)) {
+							if (await waitForRetry(event.error, kind, attemptStartedAt)) {
 								retry = true;
 								break;
 							}
@@ -358,7 +391,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						const eventHasSubstantiveOutput = isSubstantiveOutputEvent(event);
 						hasSubstantiveOutput ||= eventHasSubstantiveOutput;
 						if (eventHasSubstantiveOutput || substantiveContentExists(event.error)) {
-							await options.queue.clearRetryState(ticket);
+							await clearObservedRetryState();
 							ticket = await releaseTicket(options.queue, ticket);
 						} else if (
 							event.type === "error" &&
@@ -369,7 +402,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							await options.queue.markRetryStateExhausted(ticket);
 						}
 						if (event.type === "done" || event.type === "error") {
-							if (event.type === "done") await options.queue.clearRetryState(ticket);
+							if (event.type === "done") await clearObservedRetryState();
 							ticket = await releaseTicket(options.queue, ticket);
 							pushEvent(event);
 							return;
@@ -387,7 +420,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					const cancelled = isCancellation(error, signal);
 					const kind = retryKind(error);
 					if (!cancelled && !hasSubstantiveOutput && kind !== undefined) {
-						if (await waitForRetry(error, kind)) continue;
+						if (await waitForRetry(error, kind, attemptStartedAt)) continue;
 					}
 					flushReplaySafeEvents();
 					if (!hasSubstantiveOutput && !cancelled && ticket && !bypassesUpstreamRetry(error)) {

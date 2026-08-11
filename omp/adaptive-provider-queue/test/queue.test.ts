@@ -4,7 +4,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, test } from "node:test";
-import { AdaptiveProviderQueue, createLaneId, sleepWithSignal } from "../src/queue.ts";
+import {
+	AdaptiveProviderQueue,
+	createLaneId,
+	sleepWithSignal,
+	type LaneRetryState,
+	type RetryAttemptEpoch,
+} from "../src/queue.ts";
 import { toOpenAIResponsesModel } from "../src/responses-model.ts";
 import {
 	AdaptiveRetryExhaustedError,
@@ -53,12 +59,17 @@ test("transient concurrency limits queue while quota and unavailable errors pass
 	assert.equal(isAdaptiveRateLimit({ errorMessage: "Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorMessage: "Error Code server_error: Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "Our servers are currently overloaded. Please try again later." }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 502, errorMessage: "server_is_overloaded" }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 504, errorMessage: "server_is_overloaded" }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 502, errorMessage: "Concurrency limit exceeded for account" }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "rate limit exceeded" }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 504, errorMessage: "Too many pending requests" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "insufficient_quota: add credits" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "resource_exhausted: quota exceeded" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "model overloaded: no capacity" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "model unavailable" }), false);
-	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "rate limit exceeded" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), false);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 401, errorMessage: "Concurrency limit exceeded" }), false);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 401, errorMessage: "authentication failed" }), false);
 });
 
@@ -84,6 +95,7 @@ test("transport and generic upstream errors use distinct adaptive retry classes"
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 500, errorMessage: "Internal server error" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "model unavailable" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Our servers are currently overloaded" }), false);
+	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Concurrency limit exceeded" }), false);
 });
 
 test("retry backoff uses ten-attempt stages and caps every wait at five minutes", () => {
@@ -155,6 +167,133 @@ test("tickets are ordered across queue instances and the next waiter wakes after
 	assert.equal(secondReachedFront, true);
 	await secondQueue.release(second);
 	assert.equal(await firstQueue.hasWaiters("lane"), false);
+});
+
+async function assertQueueFilePublicationIsSerialized(suffix: ".ticket" | ".state-lock"): Promise<void> {
+	const rootDir = await tempRoot();
+	const firstQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	const secondQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	const firstReachedWrite = Promise.withResolvers<void>();
+	const allowFirstWrite = Promise.withResolvers<void>();
+	type QueueInternals = {
+		createQueueFile(laneId: string, targetSuffix: string): Promise<Awaited<ReturnType<AdaptiveProviderQueue["acquire"]>>>;
+		waitForQueueFileTurn(
+			ticket: Awaited<ReturnType<AdaptiveProviderQueue["acquire"]>>,
+			targetSuffix: string,
+		): Promise<number>;
+		writeQueueFile(filePath: string, payload: string): Promise<void>;
+	};
+	const firstInternals = firstQueue as unknown as QueueInternals;
+	const secondInternals = secondQueue as unknown as QueueInternals;
+	const writeQueueFile = firstInternals.writeQueueFile.bind(firstQueue);
+	firstInternals.writeQueueFile = async (filePath, payload) => {
+		firstReachedWrite.resolve();
+		await allowFirstWrite.promise;
+		await writeQueueFile(filePath, payload);
+	};
+
+	const firstAcquire = firstInternals.createQueueFile("lane", suffix);
+	await firstReachedWrite.promise;
+	let secondPublished = false;
+	const secondAcquire = secondInternals.createQueueFile("lane", suffix).then(ticket => {
+		secondPublished = true;
+		return ticket;
+	});
+	try {
+		await sleepWithSignal(30);
+		assert.equal(secondPublished, false);
+	} finally {
+		allowFirstWrite.resolve();
+	}
+
+	const [first, second] = await Promise.all([firstAcquire, secondAcquire]);
+	assert.ok(first.fileName < second.fileName);
+	assert.equal(await firstInternals.waitForQueueFileTurn(first, suffix), 2);
+	let secondReachedFront = false;
+	const waiting = secondInternals.waitForQueueFileTurn(second, suffix).then(() => {
+		secondReachedFront = true;
+	});
+	await sleepWithSignal(30);
+	assert.equal(secondReachedFront, false);
+	await firstQueue.release(first);
+	await waiting;
+	assert.equal(secondReachedFront, true);
+	await secondQueue.release(second);
+}
+
+test("ticket publication is serialized before sortable names become visible", async () => {
+	await assertQueueFilePublicationIsSerialized(".ticket");
+});
+
+test("state-lock publication is serialized before sortable names become visible", async () => {
+	await assertQueueFilePublicationIsSerialized(".state-lock");
+});
+
+test("a live ticket is not reaped only because its heartbeat timestamp is old", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 1_000, random: () => 0 });
+	const ticket = await queue.acquire("lane");
+	if (ticket.heartbeat) clearInterval(ticket.heartbeat);
+	ticket.heartbeat = undefined;
+	const old = new Date(Date.now() - 5_000);
+	await fs.utimes(ticket.filePath, old, old);
+	assert.equal(await queue.hasWaiters("lane"), true);
+	assert.equal(await queue.position(ticket), 0);
+	await queue.release(ticket);
+});
+
+test("a live publication gate is preserved even when its timestamp is old", async () => {
+	const rootDir = await tempRoot();
+	const laneDir = path.join(rootDir, "lane");
+	const gatePath = path.join(laneDir, ".queue-publication.lock");
+	await fs.mkdir(laneDir, { recursive: true });
+	await fs.writeFile(gatePath, JSON.stringify({ pid: process.pid, token: "live-owner" }));
+	const old = new Date(Date.now() - 5_000);
+	await fs.utimes(gatePath, old, old);
+
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 1_000, random: () => 0 });
+	let acquired = false;
+	const pending = queue.acquire("lane").then(ticket => {
+		acquired = true;
+		return ticket;
+	});
+	await sleepWithSignal(30);
+	assert.equal(acquired, false);
+	await fs.unlink(gatePath);
+	const ticket = await pending;
+	await queue.release(ticket);
+});
+
+test("an old incomplete publication gate is reclaimed", async () => {
+	const rootDir = await tempRoot();
+	const laneDir = path.join(rootDir, "lane");
+	const gatePath = path.join(laneDir, ".queue-publication.lock");
+	await fs.mkdir(laneDir, { recursive: true });
+	await fs.writeFile(gatePath, "");
+	const old = new Date(Date.now() - 5_000);
+	await fs.utimes(gatePath, old, old);
+
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 1_000, random: () => 0 });
+	const ticket = await queue.acquire("lane");
+	await queue.release(ticket);
+	await assert.rejects(fs.stat(gatePath), error => (error as NodeJS.ErrnoException).code === "ENOENT");
+});
+
+test("a failed coordination-file write releases its publication gate", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 1_000, random: () => 0 });
+	const internals = queue as unknown as {
+		writeQueueFile(filePath: string, payload: string): Promise<void>;
+	};
+	const writeQueueFile = internals.writeQueueFile.bind(queue);
+	internals.writeQueueFile = async () => {
+		throw new Error("simulated coordination write failure");
+	};
+	await assert.rejects(queue.acquire("lane"), /simulated coordination write failure/);
+	internals.writeQueueFile = writeQueueFile;
+
+	const ticket = await queue.acquire("lane");
+	await queue.release(ticket);
 });
 
 test("queue waits honor cancellation and release remains idempotent", async () => {
@@ -232,6 +371,30 @@ test("a successful probe clears the lane retry state", async () => {
 	await queue.clearRetryState(ticket);
 	assert.equal(await queue.getRetryState("lane"), undefined);
 	await queue.release(ticket);
+});
+
+test("a recovery marker only classifies attempts that started before the successful recovery", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const owner = await queue.acquire("lane");
+	await queue.waitForTurn(owner);
+	await queue.recordRetryFailure(owner, { maxRetries: 50, kind: "rate-limit" });
+	const staleAttempt: RetryAttemptEpoch = { wallMs: Date.now(), monotonicNs: process.hrtime.bigint() };
+	await queue.clearRetryState(owner);
+	await queue.release(owner);
+
+	const staleFollower = await queue.acquire("lane");
+	await queue.waitForTurn(staleFollower);
+	const staleWindow = await queue.waitForRetryWindow(staleFollower, undefined, staleAttempt);
+	assert.equal(staleWindow.status === "ready" && staleWindow.recoveredSinceRequest, true);
+	await queue.release(staleFollower);
+
+	const freshAttempt: RetryAttemptEpoch = { wallMs: Date.now(), monotonicNs: process.hrtime.bigint() };
+	const freshFollower = await queue.acquire("lane");
+	await queue.waitForTurn(freshFollower);
+	const freshWindow = await queue.waitForRetryWindow(freshFollower, undefined, freshAttempt);
+	assert.equal(freshWindow.status === "ready" && freshWindow.recoveredSinceRequest, false);
+	await queue.release(freshFollower);
 });
 
 test("separate processes share one FIFO retry lane", async () => {
@@ -539,6 +702,80 @@ test("fallback mode bypasses but does not exhaust an active generic 503 campaign
 	assert.equal(await fallbackQueue.hasWaiters(laneId), false);
 });
 
+test("a successful fallback-mode health probe clears the generic 503 campaign it observed", async () => {
+	const rootDir = await tempRoot();
+	const ownerQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const fallbackQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const model = { provider: "primary", id: "model", baseUrl: "https://example.test/v1" };
+	const requestOptions = { apiKey: "test" };
+	const laneId = createLaneId({ ...model, apiKey: requestOptions.apiKey });
+	const owner = await ownerQueue.acquire(laneId);
+	await ownerQueue.waitForTurn(owner);
+	await ownerQueue.recordRetryFailure(owner, { maxRetries: 50, kind: "transport", status: 503 });
+	await ownerQueue.release(owner);
+
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const output = createAdaptiveStream({
+		model,
+		requestOptions,
+		queue: fallbackQueue,
+		retryTransientUpstream5xx: false,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () =>
+			new FakeInputStream([
+				{ type: "start", partial: succeeded },
+				{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+				{ type: "done", reason: "stop", message: succeeded },
+			]),
+	});
+
+	await output.completion.promise;
+	assert.equal(await fallbackQueue.getRetryState(laneId), undefined);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+});
+
+test("retry-state locking preserves a campaign that advances while an observed snapshot is cleared", async () => {
+	const rootDir = await tempRoot();
+	const writerQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const clearingQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const laneId = createLaneId({ provider: "primary", baseUrl: "https://example.test/v1", apiKey: "test" });
+	const owner = await writerQueue.acquire(laneId);
+	await writerQueue.waitForTurn(owner);
+	await writerQueue.recordRetryFailure(owner, { maxRetries: 50, kind: "transport", status: 503 });
+	const observed = await writerQueue.getRetryState(laneId);
+	assert.ok(observed);
+
+	const writerReachedStateWrite = Promise.withResolvers<void>();
+	const allowStateWrite = Promise.withResolvers<void>();
+	const writerInternals = writerQueue as unknown as {
+		writeRetryState(laneId: string, state: LaneRetryState): Promise<void>;
+	};
+	const writeRetryState = writerInternals.writeRetryState.bind(writerQueue);
+	writerInternals.writeRetryState = async (targetLaneId, state) => {
+		if (state.attempt === 2) {
+			writerReachedStateWrite.resolve();
+			await allowStateWrite.promise;
+		}
+		await writeRetryState(targetLaneId, state);
+	};
+
+	const advance = writerQueue.recordRetryFailure(owner, { maxRetries: 50, kind: "transport", status: 503 });
+	await writerReachedStateWrite.promise;
+	let clearSettled = false;
+	const clear = clearingQueue.clearRetryStateSnapshot(laneId, observed).then(result => {
+		clearSettled = true;
+		return result;
+	});
+	await sleepWithSignal(30);
+	assert.equal(clearSettled, false);
+	allowStateWrite.resolve();
+
+	assert.deepEqual(await advance, { status: "retry", attempt: 2, maxRetries: 50, delayMs: 0 });
+	assert.equal(await clear, false);
+	assert.equal((await clearingQueue.getRetryState(laneId))?.attempt, 2);
+	await writerQueue.release(owner);
+});
+
 test("fallback mode releases a claimed campaign when its probe receives a generic 503", async () => {
 	const rootDir = await tempRoot();
 	const ownerQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
@@ -838,6 +1075,7 @@ test("explicit server overload retries instead of reaching fallback", async () =
 	const rootDir = await tempRoot();
 	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
 	const overloaded = assistant({
+		errorStatus: 504,
 		errorMessage: "Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later.",
 	});
 	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });

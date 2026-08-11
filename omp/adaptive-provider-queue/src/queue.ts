@@ -41,9 +41,21 @@ export type RetryFailureDecision =
 	| { status: "retry"; attempt: number; maxRetries: number; delayMs: number }
 	| { status: "exhausted"; attempt: number; maxRetries: number };
 
+export interface RetryAttemptEpoch {
+	readonly wallMs: number;
+	readonly monotonicNs: bigint;
+}
+
 export type RetryWindowDecision =
-	| { status: "ready"; state?: LaneRetryState; claimed: boolean }
+	| { status: "ready"; state?: LaneRetryState; claimed: boolean; recoveredSinceRequest?: boolean }
 	| { status: "exhausted"; state: LaneRetryState };
+
+interface LaneRecoveryMarker {
+	readonly version: 1;
+	readonly recoveredAt: number;
+	readonly recoveredAtNs: string;
+	readonly expiresAt: number;
+}
 
 const DEFAULT_POLL_MS = 250;
 const DEFAULT_STALE_MS = 60_000;
@@ -55,6 +67,10 @@ const RETRY_STAGE_SIZE = 10;
 const RETRY_STAGE_DELAYS_MS = [60_000, 120_000, 180_000, 300_000] as const;
 const HEARTBEAT_DIVISOR = 3;
 const RETRY_STATE_FILE_NAME = "retry-state.json";
+const RETRY_RECOVERY_FILE_NAME = "retry-recovery.json";
+const REQUEST_TICKET_SUFFIX = ".ticket";
+const RETRY_STATE_LOCK_SUFFIX = ".state-lock";
+const QUEUE_PUBLICATION_LOCK_FILE_NAME = ".queue-publication.lock";
 
 let ticketSequence = 0;
 
@@ -115,10 +131,36 @@ function processIsAlive(pid: number): boolean {
 	}
 }
 
+function sameRetryState(left: LaneRetryState, right: LaneRetryState): boolean {
+	return (
+		left.version === right.version &&
+		left.status === right.status &&
+		left.attempt === right.attempt &&
+		left.maxRetries === right.maxRetries &&
+		left.ownerFileName === right.ownerFileName &&
+		left.nextRetryAt === right.nextRetryAt &&
+		left.updatedAt === right.updatedAt &&
+		left.expiresAt === right.expiresAt &&
+		left.lastKind === right.lastKind &&
+		left.lastStatus === right.lastStatus
+	);
+}
+
 async function readTicketPid(filePath: string): Promise<number | undefined> {
 	try {
 		const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as { pid?: unknown };
 		return typeof parsed.pid === "number" ? parsed.pid : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function readPublicationLock(filePath: string): Promise<{ pid: number; token: string } | undefined> {
+	try {
+		const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as { pid?: unknown; token?: unknown };
+		return typeof parsed.pid === "number" && typeof parsed.token === "string"
+			? { pid: parsed.pid, token: parsed.token }
+			: undefined;
 	} catch {
 		return undefined;
 	}
@@ -155,6 +197,10 @@ export class AdaptiveProviderQueue {
 
 	private retryStatePath(laneId: string): string {
 		return path.join(this.laneDir(laneId), RETRY_STATE_FILE_NAME);
+	}
+
+	private retryRecoveryPath(laneId: string): string {
+		return path.join(this.laneDir(laneId), RETRY_RECOVERY_FILE_NAME);
 	}
 
 	private parseRetryState(value: unknown): LaneRetryState | undefined {
@@ -221,9 +267,50 @@ export class AdaptiveProviderQueue {
 		}
 	}
 
-	private async listLiveTicketNames(laneId: string): Promise<string[]> {
+	private async readRecoveryMarker(laneId: string): Promise<LaneRecoveryMarker | undefined> {
+		try {
+			const parsed = JSON.parse(await fs.readFile(this.retryRecoveryPath(laneId), "utf8")) as Partial<LaneRecoveryMarker>;
+			if (
+				parsed.version !== 1 ||
+				typeof parsed.recoveredAt !== "number" ||
+				!Number.isFinite(parsed.recoveredAt) ||
+				typeof parsed.recoveredAtNs !== "string" ||
+				!/^\d+$/.test(parsed.recoveredAtNs) ||
+				typeof parsed.expiresAt !== "number" ||
+				!Number.isFinite(parsed.expiresAt) ||
+				parsed.expiresAt <= Date.now()
+			) {
+				return undefined;
+			}
+			return parsed as LaneRecoveryMarker;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
+			throw error;
+		}
+	}
+
+	private async writeRecoveryMarker(laneId: string): Promise<void> {
 		const laneDir = await this.ensureLaneDir(laneId);
-		const names = (await fs.readdir(laneDir)).filter(name => name.endsWith(".ticket")).sort();
+		const recoveredAt = Date.now();
+		const marker: LaneRecoveryMarker = {
+			version: 1,
+			recoveredAt,
+			recoveredAtNs: process.hrtime.bigint().toString(),
+			expiresAt: recoveredAt + this.retryStateTtlMs,
+		};
+		const markerPath = this.retryRecoveryPath(laneId);
+		const tempPath = path.join(laneDir, `.retry-recovery-${process.pid}-${randomUUID()}.tmp`);
+		try {
+			await fs.writeFile(tempPath, JSON.stringify(marker), { encoding: "utf8", flag: "wx", mode: 0o600 });
+			await fs.rename(tempPath, markerPath);
+		} finally {
+			await fs.unlink(tempPath).catch(() => {});
+		}
+	}
+
+	private async listLiveQueueFileNames(laneId: string, suffix: string): Promise<string[]> {
+		const laneDir = await this.ensureLaneDir(laneId);
+		const names = (await fs.readdir(laneDir)).filter(name => name.endsWith(suffix)).sort();
 		const live: string[] = [];
 		for (const name of names) {
 			const filePath = path.join(laneDir, name);
@@ -231,7 +318,7 @@ export class AdaptiveProviderQueue {
 				const stat = await fs.stat(filePath);
 				const pid = await readTicketPid(filePath);
 				const stale = Date.now() - stat.mtimeMs > this.staleMs;
-				if ((pid !== undefined && !processIsAlive(pid)) || stale) {
+				if ((pid !== undefined && !processIsAlive(pid)) || (pid === undefined && stale)) {
 					await fs.unlink(filePath).catch(() => {});
 					continue;
 				}
@@ -243,60 +330,139 @@ export class AdaptiveProviderQueue {
 		return live;
 	}
 
-	async hasWaiters(laneId: string): Promise<boolean> {
-		return (await this.listLiveTicketNames(laneId)).length > 0;
+	private async removeAbandonedPublicationLock(lockPath: string): Promise<boolean> {
+		try {
+			const [stat, owner] = await Promise.all([fs.stat(lockPath), readPublicationLock(lockPath)]);
+			if (owner && processIsAlive(owner.pid)) return false;
+			if (!owner && Date.now() - stat.mtimeMs <= this.staleMs) return false;
+			const currentOwner = await readPublicationLock(lockPath);
+			if (owner?.token !== currentOwner?.token) return false;
+			if (currentOwner && processIsAlive(currentOwner.pid)) return false;
+			await fs.unlink(lockPath).catch(error => {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			});
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+			throw error;
+		}
 	}
 
-	async getRetryState(laneId: string): Promise<LaneRetryState | undefined> {
-		return this.readRetryState(laneId);
-	}
-
-	async hasRetryState(laneId: string): Promise<boolean> {
-		return (await this.readRetryState(laneId)) !== undefined;
-	}
-
-	async acquire(laneId: string): Promise<QueueTicket> {
+	private async withQueuePublicationLock<T>(laneId: string, operation: (laneDir: string) => Promise<T>): Promise<T> {
 		const laneDir = await this.ensureLaneDir(laneId);
-		const monotonic = process.hrtime.bigint().toString().padStart(20, "0");
-		const sequence = (++ticketSequence).toString().padStart(8, "0");
-		const fileName = `${monotonic}-${process.pid.toString().padStart(10, "0")}-${sequence}-${randomUUID()}.ticket`;
-		const filePath = path.join(laneDir, fileName);
-		await fs.writeFile(
-			filePath,
-			JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
-			{ encoding: "utf8", flag: "wx", mode: 0o600 },
-		);
-		const ticket: QueueTicket = {
-			laneId,
-			laneDir,
-			fileName,
-			filePath,
-			heartbeat: undefined,
-			released: false,
-		};
-		const heartbeatMs = Math.max(250, Math.floor(this.staleMs / HEARTBEAT_DIVISOR));
-		ticket.heartbeat = setInterval(() => {
-			const now = new Date();
-			void fs.utimes(ticket.filePath, now, now).catch(() => {});
-		}, heartbeatMs);
-		ticket.heartbeat.unref?.();
-		return ticket;
+		const lockPath = path.join(laneDir, QUEUE_PUBLICATION_LOCK_FILE_NAME);
+		while (true) {
+			const token = randomUUID();
+			let handle: Awaited<ReturnType<typeof fs.open>>;
+			try {
+				handle = await fs.open(lockPath, "wx", 0o600);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				if (!(await this.removeAbandonedPublicationLock(lockPath))) {
+					const jitter = Math.floor(this.pollMs * 0.25 * this.random());
+					await sleepWithSignal(this.pollMs + jitter);
+				}
+				continue;
+			}
+
+			let ownsPublishedLock = false;
+			try {
+				await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), "utf8");
+				await handle.sync();
+				ownsPublishedLock = (await readPublicationLock(lockPath))?.token === token;
+				if (!ownsPublishedLock) continue;
+				return await operation(laneDir);
+			} finally {
+				const openedStat = await handle.stat().catch(() => undefined);
+				const publishedStat = await fs.stat(lockPath).catch(() => undefined);
+				if (
+					openedStat &&
+					publishedStat &&
+					openedStat.dev === publishedStat.dev &&
+					openedStat.ino === publishedStat.ino
+				) {
+					await fs.unlink(lockPath).catch(error => {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					});
+				}
+				await handle.close().catch(() => {});
+			}
+		}
 	}
 
-	async waitForTurn(ticket: QueueTicket, signal?: AbortSignal): Promise<number> {
+	private async writeQueueFile(filePath: string, payload: string): Promise<void> {
+		await fs.writeFile(filePath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
+	}
+
+	private async createQueueFile(laneId: string, suffix: string): Promise<QueueTicket> {
+		return this.withQueuePublicationLock(laneId, async laneDir => {
+			const monotonic = process.hrtime.bigint().toString().padStart(20, "0");
+			const sequence = (++ticketSequence).toString().padStart(8, "0");
+			const fileName = `${monotonic}-${process.pid.toString().padStart(10, "0")}-${sequence}-${randomUUID()}${suffix}`;
+			const filePath = path.join(laneDir, fileName);
+			await this.writeQueueFile(filePath, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+			const ticket: QueueTicket = {
+				laneId,
+				laneDir,
+				fileName,
+				filePath,
+				heartbeat: undefined,
+				released: false,
+			};
+			const heartbeatMs = Math.max(250, Math.floor(this.staleMs / HEARTBEAT_DIVISOR));
+			ticket.heartbeat = setInterval(() => {
+				const now = new Date();
+				void fs.utimes(ticket.filePath, now, now).catch(() => {});
+			}, heartbeatMs);
+			ticket.heartbeat.unref?.();
+			return ticket;
+		});
+	}
+
+	private async waitForQueueFileTurn(ticket: QueueTicket, suffix: string, signal?: AbortSignal): Promise<number> {
 		while (true) {
 			if (signal?.aborted) throw abortError();
-			const names = await this.listLiveTicketNames(ticket.laneId);
+			const names = await this.listLiveQueueFileNames(ticket.laneId, suffix);
 			const position = names.indexOf(ticket.fileName);
-			if (position < 0) throw new Error("Adaptive provider queue ticket disappeared while waiting");
+			if (position < 0) throw new Error("Adaptive provider queue coordination file disappeared while waiting");
 			if (position === 0) return names.length;
 			const jitter = Math.floor(this.pollMs * 0.25 * this.random());
 			await sleepWithSignal(this.pollMs + jitter, signal);
 		}
 	}
 
+	private async withRetryStateLock<T>(laneId: string, operation: () => Promise<T>): Promise<T> {
+		const lock = await this.createQueueFile(laneId, RETRY_STATE_LOCK_SUFFIX);
+		try {
+			await this.waitForQueueFileTurn(lock, RETRY_STATE_LOCK_SUFFIX);
+			return await operation();
+		} finally {
+			await this.release(lock);
+		}
+	}
+
+	async hasWaiters(laneId: string): Promise<boolean> {
+		return (await this.listLiveQueueFileNames(laneId, REQUEST_TICKET_SUFFIX)).length > 0;
+	}
+
+	async getRetryState(laneId: string): Promise<LaneRetryState | undefined> {
+		return this.withRetryStateLock(laneId, () => this.readRetryState(laneId));
+	}
+
+	async hasRetryState(laneId: string): Promise<boolean> {
+		return (await this.getRetryState(laneId)) !== undefined;
+	}
+
+	async acquire(laneId: string): Promise<QueueTicket> {
+		return this.createQueueFile(laneId, REQUEST_TICKET_SUFFIX);
+	}
+
+	async waitForTurn(ticket: QueueTicket, signal?: AbortSignal): Promise<number> {
+		return this.waitForQueueFileTurn(ticket, REQUEST_TICKET_SUFFIX, signal);
+	}
+
 	async position(ticket: QueueTicket): Promise<number> {
-		const names = await this.listLiveTicketNames(ticket.laneId);
+		const names = await this.listLiveQueueFileNames(ticket.laneId, REQUEST_TICKET_SUFFIX);
 		const position = names.indexOf(ticket.fileName);
 		if (position < 0) throw new Error("Adaptive provider queue ticket disappeared while checking position");
 		return position;
@@ -341,95 +507,133 @@ export class AdaptiveProviderQueue {
 		options: { maxRetries: number; retryAfterMs?: number; kind: RetryFailureKind; status?: number },
 	): Promise<RetryFailureDecision> {
 		await this.assertFront(ticket);
-		const existing = await this.readRetryState(ticket.laneId);
-		if (existing?.status === "exhausted") {
-			return { status: "exhausted", attempt: existing.attempt, maxRetries: existing.maxRetries };
-		}
+		return this.withRetryStateLock(ticket.laneId, async () => {
+			const existing = await this.readRetryState(ticket.laneId);
+			if (existing?.status === "exhausted") {
+				return { status: "exhausted", attempt: existing.attempt, maxRetries: existing.maxRetries };
+			}
 
-		const requestedBudget = Math.max(0, Math.floor(options.maxRetries));
-		const maxRetries = existing?.maxRetries ?? requestedBudget;
-		const retryNumber = (existing?.attempt ?? 0) + 1;
-		const now = Date.now();
-		if (retryNumber > maxRetries) {
-			const attempt = existing?.attempt ?? maxRetries;
+			const requestedBudget = Math.max(0, Math.floor(options.maxRetries));
+			const maxRetries = existing?.maxRetries ?? requestedBudget;
+			const retryNumber = (existing?.attempt ?? 0) + 1;
+			const now = Date.now();
+			if (retryNumber > maxRetries) {
+				const attempt = existing?.attempt ?? maxRetries;
+				await this.writeRetryState(ticket.laneId, {
+					version: 1,
+					status: "exhausted",
+					attempt,
+					maxRetries,
+					ownerFileName: ticket.fileName,
+					nextRetryAt: now,
+					updatedAt: now,
+					expiresAt: now + this.retryStateTtlMs,
+					lastKind: options.kind,
+					lastStatus: options.status,
+				});
+				return { status: "exhausted", attempt, maxRetries };
+			}
+
+			const delayMs = this.backoffDelayMs(retryNumber, options.retryAfterMs);
+			const nextRetryAt = now + delayMs;
 			await this.writeRetryState(ticket.laneId, {
 				version: 1,
-				status: "exhausted",
-				attempt,
+				status: "active",
+				attempt: retryNumber,
 				maxRetries,
 				ownerFileName: ticket.fileName,
-				nextRetryAt: now,
+				nextRetryAt,
 				updatedAt: now,
-				expiresAt: now + this.retryStateTtlMs,
+				expiresAt: nextRetryAt + this.retryStateTtlMs,
 				lastKind: options.kind,
 				lastStatus: options.status,
 			});
-			return { status: "exhausted", attempt, maxRetries };
-		}
-
-		const delayMs = this.backoffDelayMs(retryNumber, options.retryAfterMs);
-		const nextRetryAt = now + delayMs;
-		await this.writeRetryState(ticket.laneId, {
-			version: 1,
-			status: "active",
-			attempt: retryNumber,
-			maxRetries,
-			ownerFileName: ticket.fileName,
-			nextRetryAt,
-			updatedAt: now,
-			expiresAt: nextRetryAt + this.retryStateTtlMs,
-			lastKind: options.kind,
-			lastStatus: options.status,
+			return { status: "retry", attempt: retryNumber, maxRetries, delayMs };
 		});
-		return { status: "retry", attempt: retryNumber, maxRetries, delayMs };
 	}
 
-	async waitForRetryWindow(ticket: QueueTicket, signal?: AbortSignal): Promise<RetryWindowDecision> {
+	async waitForRetryWindow(
+		ticket: QueueTicket,
+		signal?: AbortSignal,
+		requestStartedAt?: RetryAttemptEpoch,
+	): Promise<RetryWindowDecision> {
 		await this.assertFront(ticket);
-		let state = await this.readRetryState(ticket.laneId);
-		if (!state) return { status: "ready", claimed: false };
-		if (state.status === "exhausted") return { status: "exhausted", state };
+		const decision = await this.withRetryStateLock<RetryWindowDecision>(ticket.laneId, async () => {
+			let state = await this.readRetryState(ticket.laneId);
+			if (!state) {
+				const recovery = requestStartedAt === undefined ? undefined : await this.readRecoveryMarker(ticket.laneId);
+				return {
+					status: "ready",
+					claimed: false,
+					recoveredSinceRequest:
+						recovery !== undefined &&
+						recovery.recoveredAt >= requestStartedAt.wallMs &&
+						BigInt(recovery.recoveredAtNs) > requestStartedAt.monotonicNs,
+				};
+			}
+			if (state.status === "exhausted") return { status: "exhausted", state };
 
-		let claimed = false;
-		if (state.ownerFileName !== ticket.fileName) {
-			claimed = true;
-			const now = Date.now();
-			state = {
-				...state,
-				ownerFileName: ticket.fileName,
-				updatedAt: now,
-				expiresAt: Math.max(state.expiresAt, state.nextRetryAt + this.retryStateTtlMs, now + this.retryStateTtlMs),
-			};
-			await this.writeRetryState(ticket.laneId, state);
-		}
-		await sleepWithSignal(Math.max(0, state.nextRetryAt - Date.now()), signal);
-		return { status: "ready", state, claimed };
+			let claimed = false;
+			if (state.ownerFileName !== ticket.fileName) {
+				claimed = true;
+				const now = Date.now();
+				state = {
+					...state,
+					ownerFileName: ticket.fileName,
+					updatedAt: now,
+					expiresAt: Math.max(state.expiresAt, state.nextRetryAt + this.retryStateTtlMs, now + this.retryStateTtlMs),
+				};
+				await this.writeRetryState(ticket.laneId, state);
+			}
+			return { status: "ready", state, claimed };
+		});
+		if (decision.status === "exhausted" || !decision.state) return decision;
+		await sleepWithSignal(Math.max(0, decision.state.nextRetryAt - Date.now()), signal);
+		return decision;
 	}
 
 	async markRetryStateExhausted(ticket: QueueTicket): Promise<LaneRetryState | undefined> {
 		await this.assertFront(ticket);
-		const state = await this.readRetryState(ticket.laneId);
-		if (!state || state.status === "exhausted" || state.ownerFileName !== ticket.fileName) return state;
-		const now = Date.now();
-		const exhausted: LaneRetryState = {
-			...state,
-			status: "exhausted",
-			nextRetryAt: now,
-			updatedAt: now,
-			expiresAt: now + this.retryStateTtlMs,
-			lastKind: "terminal",
-		};
-		await this.writeRetryState(ticket.laneId, exhausted);
-		return exhausted;
+		return this.withRetryStateLock(ticket.laneId, async () => {
+			const state = await this.readRetryState(ticket.laneId);
+			if (!state || state.status === "exhausted" || state.ownerFileName !== ticket.fileName) return state;
+			const now = Date.now();
+			const exhausted: LaneRetryState = {
+				...state,
+				status: "exhausted",
+				nextRetryAt: now,
+				updatedAt: now,
+				expiresAt: now + this.retryStateTtlMs,
+				lastKind: "terminal",
+			};
+			await this.writeRetryState(ticket.laneId, exhausted);
+			return exhausted;
+		});
 	}
 
 	async clearRetryState(ticket: QueueTicket | undefined): Promise<void> {
 		if (!ticket || ticket.released) return;
 		await this.assertFront(ticket);
-		const state = await this.readRetryState(ticket.laneId);
-		if (!state || state.ownerFileName !== ticket.fileName) return;
-		await fs.unlink(this.retryStatePath(ticket.laneId)).catch(error => {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		await this.withRetryStateLock(ticket.laneId, async () => {
+			const state = await this.readRetryState(ticket.laneId);
+			if (!state || state.ownerFileName !== ticket.fileName) return;
+			await fs.unlink(this.retryStatePath(ticket.laneId)).catch(error => {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			});
+			await this.writeRecoveryMarker(ticket.laneId);
+		});
+	}
+
+	/** Clear a campaign observed by a queue-bypassing health probe without deleting a newer state. */
+	async clearRetryStateSnapshot(laneId: string, expected: LaneRetryState): Promise<boolean> {
+		return this.withRetryStateLock(laneId, async () => {
+			const current = await this.readRetryState(laneId);
+			if (!current || !sameRetryState(current, expected)) return false;
+			await fs.unlink(this.retryStatePath(laneId)).catch(error => {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			});
+			await this.writeRecoveryMarker(laneId);
+			return true;
 		});
 	}
 

@@ -3,7 +3,12 @@ import { test } from "node:test";
 import {
 	ADAPTIVE_5XX_POLICY_ENTRY,
 	DEFAULT_TRANSIENT_UPSTREAM_MODE,
+	createSessionPolicyStore,
 	parseTransientUpstreamModeCommand,
+	restoreSessionPolicy,
+	sessionPolicyMode,
+	setSessionPolicy,
+	sharedSessionPolicyStore,
 	transientUpstreamModeFromEntries,
 } from "../src/session-policy.ts";
 
@@ -47,4 +52,98 @@ test("the session command parses status, explicit modes and toggle", () => {
 	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry"), "fallback");
 	assert.equal(parseTransientUpstreamModeCommand("toggle", "fallback"), "retry");
 	assert.equal(parseTransientUpstreamModeCommand("unknown", "retry"), undefined);
+});
+
+test("subagents stay attached to their root policy after the interactive session switches", () => {
+	const store = createSessionPolicyStore();
+	const rootEntries = [
+		{ type: "custom", customType: ADAPTIVE_5XX_POLICY_ENTRY, data: { mode: "fallback" } },
+	];
+
+	assert.equal(
+		restoreSessionPolicy(store, {
+			sessionId: "root-a",
+			entries: rootEntries,
+			hasUI: true,
+			artifactsDir: "/sessions/root-a",
+		}),
+		"fallback",
+	);
+	assert.equal(
+		restoreSessionPolicy(store, {
+			sessionId: "child-a",
+			entries: [],
+			hasUI: false,
+			lineageSessionId: "root-a",
+			artifactsDir: "/sessions/root-a",
+		}),
+		"fallback",
+	);
+	restoreSessionPolicy(store, {
+		sessionId: "root-b",
+		entries: [],
+		hasUI: true,
+		artifactsDir: "/sessions/root-b",
+	});
+	assert.equal(
+		restoreSessionPolicy(store, {
+			sessionId: "nested-child-a",
+			entries: [],
+			hasUI: false,
+			lineageSessionId: "root-b",
+			artifactsDir: "/sessions/root-a",
+		}),
+		"fallback",
+	);
+
+	assert.equal(sessionPolicyMode(store, "child-a"), "fallback");
+	assert.equal(sessionPolicyMode(store, "nested-child-a"), "fallback");
+	assert.equal(sessionPolicyMode(store, "root-b"), "retry");
+	setSessionPolicy(store, "root-a", "retry");
+	assert.equal(sessionPolicyMode(store, "child-a"), "retry");
+	assert.equal(sessionPolicyMode(store, "nested-child-a"), "retry");
+});
+
+test("headless roots and their children resolve policy without an interactive session", () => {
+	const store = createSessionPolicyStore();
+	const rootEntries = [
+		{ type: "custom", customType: ADAPTIVE_5XX_POLICY_ENTRY, data: { mode: "fallback" } },
+	];
+
+	assert.equal(
+		restoreSessionPolicy(store, {
+			sessionId: "headless-root",
+			entries: rootEntries,
+			hasUI: false,
+			lineageSessionId: "headless-root",
+			artifactsDir: "/sessions/headless-root",
+		}),
+		"fallback",
+	);
+	assert.equal(
+		restoreSessionPolicy(store, {
+			sessionId: "headless-child",
+			entries: [],
+			hasUI: false,
+			lineageSessionId: "headless-root",
+			artifactsDir: "/sessions/headless-root",
+		}),
+		"fallback",
+	);
+});
+
+test("session policy is keyed by request session and tree restoration can return to the default", () => {
+	const store = createSessionPolicyStore();
+	restoreSessionPolicy(store, { sessionId: "root", entries: [], hasUI: true });
+	setSessionPolicy(store, "root", "fallback");
+	setSessionPolicy(store, "other", "retry");
+
+	assert.equal(sessionPolicyMode(store, "root"), "fallback");
+	assert.equal(sessionPolicyMode(store, "other"), "retry");
+	assert.equal(sessionPolicyMode(store, "unknown-provider-session"), "fallback");
+	assert.equal(restoreSessionPolicy(store, { sessionId: "root", entries: [], hasUI: true }), "retry");
+});
+
+test("all extension module instances resolve one process-wide policy store", () => {
+	assert.equal(sharedSessionPolicyStore(), sharedSessionPolicyStore());
 });

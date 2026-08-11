@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.1 - 2026-08-11
+
+- Keep the current generic-5xx policy visible in the status bar for both modes:
+  `5xx: retry 50x` or `5xx: immediate fallback`.
+- Resolve policy from a process-wide, session-keyed store and stable artifact
+  lineage, so subagent extension registration or a later root-session switch
+  cannot replace a detached subagent's effective provider policy.
+- Restore policy after session-tree navigation and persist changes through the
+  public `pi.appendEntry` extension API.
+- Give explicit concurrency/rate-limit and `server_is_overloaded` semantics
+  priority over a `502/503/504` status, so those failures still retry in either
+  session mode.
+- Let a successful fallback-mode health probe clear the exact generic-5xx
+  recovery campaign it observed without deleting a newer concurrent campaign.
+- Serialize retry-state reads and writes through a cross-process FIFO state
+  lock so snapshot cleanup cannot expose a missing file and reset the attempt
+  counter during a concurrent failure update.
+- Atomically serialize queue and state-lock file publication so an older
+  sortable coordination name cannot appear after a newer owner has entered.
+- Keep coordination files owned by a live PID even if their heartbeat is old,
+  avoiding split-brain probes after system sleep or a long event-loop stall.
+- Retain a short-lived recovery marker so a concurrent failure that reaches
+  the queue after the successful owner has exited does not restart attempt 1.
+
 ## 0.4.0 - 2026-08-11
 
 - Add `/adaptive-5xx status|retry|fallback|toggle` to choose generic upstream

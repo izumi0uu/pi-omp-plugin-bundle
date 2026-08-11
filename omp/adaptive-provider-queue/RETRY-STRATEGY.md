@@ -69,14 +69,29 @@ tool call 或图片，就不重放。手动取消会立即中断等待，但不�
 - 选择写入当前 session JSONL；`/resume` 会恢复。fork 的活动分支包含该记录时会继承。
 - `/new` 没有旧记录，因此回到默认 `retry`。
 - root session 创建的 subagent 沿用 root 当前模式。
-- `fallback` 模式激活时，状态栏显示 `5xx: immediate fallback`。
+- detached 或嵌套 subagent 会按稳定的 artifacts lineage 绑定原 root；即使 UI 后来
+  switch 到另一个 session，也不会改用新 session 的策略。
+- 两种模式都持续显示在状态栏：`5xx: retry 50x` 或 `5xx: immediate fallback`。
+- `/tree` 跳转到其他历史节点时，会按新活动分支重新恢复策略。
 - 开关不影响明确的 concurrency/rate limit、`server_is_overloaded`、
-  `stream_read_error`、无 HTTP 状态的 timeout/socket/network failure；这些仍重试。
+  `stream_read_error`、无 HTTP 状态的 timeout/socket/network failure；即使明确限流或
+  server overload 同时带有 `502/503/504`，这些仍重试。
 - 开关也不影响鉴权、额度、billing、明确 model unavailable；这些仍立即交给 fallback。
 
 如果同一 endpoint + credential lane 的其他窗口正在执行普通 5xx 恢复活动，
 `fallback` session 不加入这份活动，也不会把它标记为 `exhausted`。它独立请求一次，
 若仍得到普通 5xx，就只让当前 session 进入 OMP fallback。
+如果这次独立请求成功，它会清除自己开始请求时观察到的恢复活动；若其他窗口已把
+活动推进到更新状态，则保留更新状态，避免误删并发恢复进度。
+所有 retry-state 读写与这次 compare-and-clear 共用跨进程 FIFO 状态锁，因此清理时
+不会短暂暴露“无状态”并把并发窗口的 attempt 计数重置为 1。
+队列 ticket 与状态锁文件在分配可排序名称和落盘时还会经过原子发布门锁，避免较旧
+名称晚落盘并与已经进入临界区的新 owner 并行。
+有效元数据中的 PID 仍存活时，不会仅因 heartbeat 时间戳过旧而回收协调文件；这能
+避免系统睡眠或 event loop 长暂停后出现两个并行 probe。只有 PID 已退出，或缺损
+元数据超过 stale 阈值，才会回收文件。
+成功恢复还会保留一个短期 recovery marker；这样并发窗口的旧失败即使在成功 owner
+已经清理 retry-state 并退出队列后才排到队首，也不会重新从 attempt 1 开始计数。
 
 ### 跨窗口恢复状态
 

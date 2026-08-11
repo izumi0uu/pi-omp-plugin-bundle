@@ -34,11 +34,15 @@ New sessions default to `retry`. `fallback` forwards a generic `502/503/504`
 after the first failed request so OMP can traverse its model fallback chain.
 The choice is stored in the session, restored by `/resume`, and inherited by a
 fork whose active branch contains the policy entry. The status bar displays
-`5xx: immediate fallback` while `fallback` is active. Subagents created by the
-session use the root session's current choice.
+`5xx: retry 50x` or `5xx: immediate fallback`, so the effective choice remains
+visible after the command notification closes. Subagents created by the session
+use that root session's current choice, including detached and nested subagents
+that outlive a later root-session switch. Policy lookup is keyed by request
+session and stable artifact lineage, so a subagent reloading the provider cannot
+replace or migrate the root policy.
 
 This switch is intentionally narrow. Explicit concurrency/rate-limit or
-`server_is_overloaded` failures, status-less transport failures and
+`server_is_overloaded` failures, even when accompanied by `502/503/504`, status-less transport failures and
 `stream_read_error` still use the shared retry campaign in both modes.
 Authentication, quota, billing and explicit model-unavailable failures still
 pass through immediately in both modes.

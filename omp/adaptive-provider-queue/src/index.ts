@@ -18,9 +18,11 @@ import { AdaptiveProviderQueue } from "./queue.ts";
 import { toOpenAIResponsesModel } from "./responses-model.ts";
 import {
 	ADAPTIVE_5XX_POLICY_ENTRY,
-	DEFAULT_TRANSIENT_UPSTREAM_MODE,
 	parseTransientUpstreamModeCommand,
-	transientUpstreamModeFromEntries,
+	restoreSessionPolicy,
+	sessionPolicyMode,
+	setSessionPolicy,
+	sharedSessionPolicyStore,
 	type TransientUpstreamMode,
 } from "./session-policy.ts";
 import { createAdaptiveStream } from "./stream-wrapper.ts";
@@ -37,51 +39,71 @@ const queue = new AdaptiveProviderQueue({
 	baseDelayMs: 500,
 	maxDelayMs: 300_000,
 });
+const sessionPolicies = sharedSessionPolicyStore();
 
 export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
-	let transientUpstreamMode: TransientUpstreamMode = DEFAULT_TRANSIENT_UPSTREAM_MODE;
 	type SessionContextLike = {
-		hasUI?: boolean;
-		ui?: { notify?(message: string, type?: "info" | "warning" | "error"): void; setStatus?(key: string, text: string | undefined): void };
-		sessionManager?: { getBranch?(): unknown[]; appendCustomEntry?(customType: string, data?: unknown): string };
+		hasUI: boolean;
+		ui: { setStatus(key: string, text: string | undefined): void };
+		localProtocolOptions?: { getSessionId?(): string | null };
+		sessionManager: {
+			getArtifactsDir(): string | null;
+			getBranch(): unknown[];
+			getSessionId(): string;
+		};
 	};
-	const updateStatus = (ctx: SessionContextLike) => {
-		ctx.ui?.setStatus?.(
+	const updateStatus = (ctx: SessionContextLike, mode: TransientUpstreamMode) => {
+		if (!ctx.hasUI) return;
+		ctx.ui.setStatus(
 			"adaptive-provider-queue:5xx",
-			transientUpstreamMode === "fallback" ? "5xx: immediate fallback" : undefined,
+			mode === "fallback" ? "5xx: immediate fallback" : "5xx: retry 50x",
 		);
 	};
-	const restoreSessionPolicy = (ctx: SessionContextLike) => {
-		if (ctx.hasUI === false) return;
-		transientUpstreamMode = transientUpstreamModeFromEntries(ctx.sessionManager?.getBranch?.() ?? []);
-		updateStatus(ctx);
+	const rehydrateSessionPolicy = (ctx: SessionContextLike) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const lineageSessionId = ctx.localProtocolOptions?.getSessionId?.() ?? undefined;
+		const artifactsDir = ctx.sessionManager.getArtifactsDir() ?? undefined;
+		const mode = restoreSessionPolicy(sessionPolicies, {
+			sessionId,
+			entries: ctx.sessionManager.getBranch(),
+			hasUI: ctx.hasUI,
+			lineageSessionId,
+			artifactsDir,
+		});
+		updateStatus(ctx, mode);
 	};
-	const streamOptions = () => ({ retryTransientUpstream5xx: transientUpstreamMode === "retry" });
+	const streamOptions = (options: { sessionId?: string } | undefined) => ({
+		retryTransientUpstream5xx: sessionPolicyMode(sessionPolicies, options?.sessionId) === "retry",
+	});
 
 	pi.registerCommand("adaptive-5xx", {
 		description: "Choose whether generic 502/503/504 errors retry or immediately fall back in this session",
 		handler: (args, ctx) => {
-			const command = parseTransientUpstreamModeCommand(args, transientUpstreamMode);
+			const sessionId = ctx.sessionManager.getSessionId();
+			const currentMode = sessionPolicyMode(sessionPolicies, sessionId);
+			const command = parseTransientUpstreamModeCommand(args, currentMode);
 			if (!command) {
 				ctx.ui.notify("Usage: /adaptive-5xx [status|retry|fallback|toggle]", "warning");
 				return;
 			}
 			if (command !== "status") {
-				transientUpstreamMode = command;
-				ctx.sessionManager.appendCustomEntry(ADAPTIVE_5XX_POLICY_ENTRY, { mode: command });
-				updateStatus(ctx);
+				setSessionPolicy(sessionPolicies, sessionId, command);
+				pi.appendEntry(ADAPTIVE_5XX_POLICY_ENTRY, { mode: command });
 			}
+			const mode = sessionPolicyMode(sessionPolicies, sessionId);
+			updateStatus(ctx, mode);
 			ctx.ui.notify(
-				transientUpstreamMode === "retry"
+				mode === "retry"
 					? "Generic 502/503/504 errors will use the shared 50-attempt retry campaign in this session."
 					: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
 				"info",
 			);
 		},
 	});
-	pi.on("session_start", (_event, ctx) => restoreSessionPolicy(ctx));
-	pi.on("session_switch", (_event, ctx) => restoreSessionPolicy(ctx));
-	pi.on("session_branch", (_event, ctx) => restoreSessionPolicy(ctx));
+	pi.on("session_start", (_event, ctx) => rehydrateSessionPolicy(ctx));
+	pi.on("session_switch", (_event, ctx) => rehydrateSessionPolicy(ctx));
+	pi.on("session_branch", (_event, ctx) => rehydrateSessionPolicy(ctx));
+	pi.on("session_tree", (_event, ctx) => rehydrateSessionPolicy(ctx));
 
 	pi.registerProvider("adaptive-provider-queue", {
 		api: QUEUED_RESPONSES_API,
@@ -91,7 +113,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				requestOptions: options,
 				queue,
 				maxRetries: 50,
-				...streamOptions(),
+				...streamOptions(options),
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: () =>
 					streamSimple(
@@ -181,7 +203,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				requestOptions: options,
 				queue,
 				maxRetries: 50,
-				...streamOptions(),
+				...streamOptions(options),
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: () => {
 					const canonicalModel = getModel("kimi-code", model.id);
