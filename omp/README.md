@@ -4,6 +4,6 @@
 
 | Plugin | Purpose |
 |---|---|
-| [`adaptive-provider-queue`](adaptive-provider-queue/) | 遇到瞬时并发限流后启用跨进程 FIFO 排队；其他不可用错误继续交给 OMP fallback |
+| [`adaptive-provider-queue`](adaptive-provider-queue/) | 跨进程 FIFO 恢复、共享重试预算与单槽位进度条；其他不可用错误交给 OMP fallback |
 | [`pi-tool-display`](pi-tool-display/) | OMP-native compact tool output, diff rendering, thinking labels, and the `/tool-display` settings command |
 | [`perplexity-role`](perplexity-role/) | 使用 Perplexity-first `web_search` 的独立主 Agent 窗口，无 task agent 委派 |

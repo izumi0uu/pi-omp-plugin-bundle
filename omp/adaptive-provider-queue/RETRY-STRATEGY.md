@@ -72,6 +72,11 @@ tool call 或图片，就不重放。手动取消会立即中断等待，但不�
 - detached 或嵌套 subagent 会按稳定的 artifacts lineage 绑定原 root；即使 UI 后来
   switch 到另一个 session，也不会改用新 session 的策略。
 - 两种模式都持续显示在状态栏：`5xx: retry 50x` 或 `5xx: immediate fallback`。
+- 实际进入共享恢复后，同一个可覆盖的状态槽会显示 provider、`attempt/50` 进度条、
+  错误类型和队列位置，例如
+  `TokenKing retry 2/50 [#-----------] transport q1/2`；成功、取消或最终失败后清除，
+  不会为每次重试叠加通知。只有携带当前交互 session ID 的请求能写入该槽位；
+  detached/nested subagent 与缺失 session ID 的后台请求都不抢占 root 窗口的进度。
 - `/tree` 跳转到其他历史节点时，会按新活动分支重新恢复策略。
 - 开关不影响明确的 concurrency/rate limit、`server_is_overloaded`、
   `stream_read_error`、无 HTTP 状态的 timeout/socket/network failure；即使明确限流或
@@ -85,13 +90,19 @@ tool call 或图片，就不重放。手动取消会立即中断等待，但不�
 活动推进到更新状态，则保留更新状态，避免误删并发恢复进度。
 所有 retry-state 读写与这次 compare-and-clear 共用跨进程 FIFO 状态锁，因此清理时
 不会短暂暴露“无状态”并把并发窗口的 attempt 计数重置为 1。
-队列 ticket 与状态锁文件在分配可排序名称和落盘时还会经过原子发布门锁，避免较旧
-名称晚落盘并与已经进入临界区的新 owner 并行。
+队列 ticket 与状态锁文件在分配可排序名称和落盘时还会经过原子发布门锁；锁内会根据
+当前 lane 的最大存活序号分配下一个序号，不使用各进程基准不同的 `hrtime` 排序。因此
+较晚启动的 OMP 进程不会生成更小名称并插到现有 owner 前面。ticket 到达队首后还会在
+同一发布锁内稳定为最小队首序号，因而滚动 `/reload` 期间仍运行的旧进程不能挤走活动
+owner；旧格式 ticket 可以安全共存。所有旧窗口完成 `/reload` 后，waiter 之间才恢复
+严格 FIFO；混跑期间旧 producer 仍可能越过尚未到队首的新版 waiter，但不会再触发
+共享状态断言或提前 fallback。
 有效元数据中的 PID 仍存活时，不会仅因 heartbeat 时间戳过旧而回收协调文件；这能
 避免系统睡眠或 event loop 长暂停后出现两个并行 probe。只有 PID 已退出，或缺损
 元数据超过 stale 阈值，才会回收文件。
-成功恢复还会保留一个短期 recovery marker；这样并发窗口的旧失败即使在成功 owner
-已经清理 retry-state 并退出队列后才排到队首，也不会重新从 attempt 1 开始计数。
+成功恢复还会保留一个带共享 generation、同时兼容旧 reader 的短期 recovery marker；
+这样并发窗口的旧失败即使在成功 owner 已经清理 retry-state 并退出队列后才排到队首，
+也不会重新从 attempt 1 开始计数。generation 不依赖跨进程不可比较的 monotonic clock。
 
 ### 跨窗口恢复状态
 

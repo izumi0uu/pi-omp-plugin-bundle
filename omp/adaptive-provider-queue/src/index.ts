@@ -16,6 +16,7 @@ import {
 } from "./kimi-config.ts";
 import { AdaptiveProviderQueue } from "./queue.ts";
 import { toOpenAIResponsesModel } from "./responses-model.ts";
+import { sharedRetryStatusController } from "./retry-progress.ts";
 import {
 	ADAPTIVE_5XX_POLICY_ENTRY,
 	parseTransientUpstreamModeCommand,
@@ -40,6 +41,7 @@ const queue = new AdaptiveProviderQueue({
 	maxDelayMs: 300_000,
 });
 const sessionPolicies = sharedSessionPolicyStore();
+const retryStatuses = sharedRetryStatusController();
 
 export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	type SessionContextLike = {
@@ -61,6 +63,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	};
 	const rehydrateSessionPolicy = (ctx: SessionContextLike) => {
 		const sessionId = ctx.sessionManager.getSessionId();
+		if (ctx.hasUI) retryStatuses.bindSession(sessionId, ctx.ui);
 		const lineageSessionId = ctx.localProtocolOptions?.getSessionId?.() ?? undefined;
 		const artifactsDir = ctx.sessionManager.getArtifactsDir() ?? undefined;
 		const mode = restoreSessionPolicy(sessionPolicies, {
@@ -74,6 +77,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	};
 	const streamOptions = (options: { sessionId?: string } | undefined) => ({
 		retryTransientUpstream5xx: sessionPolicyMode(sessionPolicies, options?.sessionId) === "retry",
+		onProgress: retryStatuses.createReporter(options?.sessionId),
 	});
 
 	pi.registerCommand("adaptive-5xx", {

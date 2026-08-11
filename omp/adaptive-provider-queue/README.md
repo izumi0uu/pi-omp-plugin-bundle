@@ -69,6 +69,22 @@ Cancellation interrupts the current wait and releases its ticket, while the
 next live queue head can claim the active campaign without resetting its count
 or retry deadline.
 
+Interactive root sessions expose retry activity through one replaceable status
+slot rather than notifications that accumulate in the transcript. A typical
+status is:
+
+```text
+TokenKing retry 2/50 [#-----------] transport q1/2
+```
+
+The bar and exact counter follow the shared lane budget; `q1/2` means this
+window is first among two live tickets. The same status key is updated as the
+attempt or queue position changes and is cleared after substantive output,
+successful completion, cancellation or terminal failure. Detached and nested
+subagents do not overwrite the active root window's progress status. Requests
+without an explicit session ID are treated as background work and cannot write
+to the interactive slot.
+
 Set OMP's global `retry.maxRetries` to `0`, as shown in
 [`examples/config.yml`](examples/config.yml). The extension owns transient
 retryable failures; disabling the outer retry loop prevents a fallback model's
@@ -174,7 +190,12 @@ npm test
 npm run pack:check
 ```
 
-The tests cover error classification, session policy restoration, generic 5xx mode switching, retry-after parsing, Responses compatibility, Kimi credential and model adaptation, cancellation, stale ticket cleanup, replay boundaries, shared retry counters, exhaustion propagation, success clearing and owner takeover between separate processes.
+The tests cover error classification, session policy restoration, generic 5xx
+mode switching, retry progress lifecycle, reverse cross-process clocks, legacy
+ticket compatibility, retry-after parsing, Responses compatibility, Kimi
+credential and model adaptation, cancellation, stale ticket cleanup, replay
+boundaries, shared retry counters, exhaustion propagation, success clearing
+and owner takeover between separate processes.
 
 ## Compatibility
 
@@ -194,6 +215,17 @@ count, ticket owner, next retry, expiry, last failure kind and optional HTTP
 status. Raw credentials
 are never stored. Dead-process and stale tickets are removed during queue scans;
 the next FIFO head claims any still-active state.
+
+Sortable ticket and retry-state-lock names receive a lane-wide order while the
+publication lock is held. They do not compare process-relative monotonic clocks,
+which are not portable ordering keys across separate Bun processes. Recovery
+markers likewise use an opaque shared generation rather than cross-process
+clock comparison. When a ticket reaches the head, it receives a stable front
+order under that same publication lock; this keeps a still-running older OMP
+process from displacing the active owner during a rolling reload. Recovery
+markers retain a version-1-compatible envelope so both old and new readers can
+observe success. Strict FIFO between all waiters requires `/reload` in every
+OMP window that still has a pre-0.4.2 extension instance in memory.
 
 ## License
 

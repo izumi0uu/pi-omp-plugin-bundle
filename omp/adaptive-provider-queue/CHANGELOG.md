@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.2 - 2026-08-11
+
+- Show queued recovery in one replaceable OMP status slot instead of emitting
+  repeated notifications. The compact progress bar includes provider, shared
+  attempt count, failure kind and queue position, and clears when recovery
+  succeeds, the stream ends or the request is cancelled.
+- Scope progress to requests with the active interactive session ID, share its
+  generation across extension instances, and prevent an older stream from
+  clearing or overwriting a newer stream's status.
+- Replace process-relative `hrtime` ticket ordering with a publication-locked,
+  lane-wide sortable order so later OMP processes cannot jump ahead of a live
+  ticket or retry-state lock. A queue head is stabilized while holding the same
+  lock, so a still-running pre-0.4.2 process cannot displace the active owner
+  during reload. Strict FIFO resumes after every older window reloads.
+- Replace cross-process recovery-time comparisons with a shared recovery
+  generation while retaining a version-1-compatible marker envelope during a
+  rolling reload.
+
 ## 0.4.1 - 2026-08-11
 
 - Keep the current generic-5xx policy visible in the status bar for both modes:

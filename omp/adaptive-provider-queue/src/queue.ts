@@ -6,8 +6,8 @@ import * as path from "node:path";
 export interface QueueTicket {
 	readonly laneId: string;
 	readonly laneDir: string;
-	readonly fileName: string;
-	readonly filePath: string;
+	fileName: string;
+	filePath: string;
 	heartbeat: ReturnType<typeof setInterval> | undefined;
 	released: boolean;
 }
@@ -41,9 +41,14 @@ export type RetryFailureDecision =
 	| { status: "retry"; attempt: number; maxRetries: number; delayMs: number }
 	| { status: "exhausted"; attempt: number; maxRetries: number };
 
-export interface RetryAttemptEpoch {
-	readonly wallMs: number;
-	readonly monotonicNs: bigint;
+export interface RetryAttemptSnapshot {
+	readonly recoveryGeneration?: string;
+}
+
+export interface QueuePosition {
+	/** One-based position within the live queue. */
+	readonly position: number;
+	readonly depth: number;
 }
 
 export type RetryWindowDecision =
@@ -51,9 +56,10 @@ export type RetryWindowDecision =
 	| { status: "exhausted"; state: LaneRetryState };
 
 interface LaneRecoveryMarker {
-	readonly version: 1;
+	readonly version: 1 | 2;
 	readonly recoveredAt: number;
-	readonly recoveredAtNs: string;
+	readonly generation: string;
+	readonly recoveredAtNs?: string;
 	readonly expiresAt: number;
 }
 
@@ -71,6 +77,8 @@ const RETRY_RECOVERY_FILE_NAME = "retry-recovery.json";
 const REQUEST_TICKET_SUFFIX = ".ticket";
 const RETRY_STATE_LOCK_SUFFIX = ".state-lock";
 const QUEUE_PUBLICATION_LOCK_FILE_NAME = ".queue-publication.lock";
+const STABLE_FRONT_ORDER = "00000000000000000000";
+const LEGACY_RECOVERY_MONOTONIC_SENTINEL = ((1n << 256n) - 1n).toString();
 
 let ticketSequence = 0;
 
@@ -269,20 +277,36 @@ export class AdaptiveProviderQueue {
 
 	private async readRecoveryMarker(laneId: string): Promise<LaneRecoveryMarker | undefined> {
 		try {
-			const parsed = JSON.parse(await fs.readFile(this.retryRecoveryPath(laneId), "utf8")) as Partial<LaneRecoveryMarker>;
+			const parsed = JSON.parse(await fs.readFile(this.retryRecoveryPath(laneId), "utf8")) as {
+				version?: unknown;
+				recoveredAt?: unknown;
+				recoveredAtNs?: unknown;
+				generation?: unknown;
+				expiresAt?: unknown;
+			};
 			if (
-				parsed.version !== 1 ||
+				(parsed.version !== 1 && parsed.version !== 2) ||
 				typeof parsed.recoveredAt !== "number" ||
 				!Number.isFinite(parsed.recoveredAt) ||
-				typeof parsed.recoveredAtNs !== "string" ||
-				!/^\d+$/.test(parsed.recoveredAtNs) ||
 				typeof parsed.expiresAt !== "number" ||
 				!Number.isFinite(parsed.expiresAt) ||
 				parsed.expiresAt <= Date.now()
 			) {
 				return undefined;
 			}
-			return parsed as LaneRecoveryMarker;
+			const generation =
+				typeof parsed.generation === "string" && parsed.generation.length > 0
+					? parsed.generation
+					: typeof parsed.recoveredAtNs === "string" && /^\d+$/.test(parsed.recoveredAtNs)
+						? `legacy:${parsed.recoveredAt}:${parsed.recoveredAtNs}`
+						: undefined;
+			if (!generation) return undefined;
+			return {
+				version: parsed.version,
+				recoveredAt: parsed.recoveredAt,
+				generation,
+				expiresAt: parsed.expiresAt,
+			};
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
 			throw error;
@@ -295,7 +319,8 @@ export class AdaptiveProviderQueue {
 		const marker: LaneRecoveryMarker = {
 			version: 1,
 			recoveredAt,
-			recoveredAtNs: process.hrtime.bigint().toString(),
+			generation: randomUUID(),
+			recoveredAtNs: LEGACY_RECOVERY_MONOTONIC_SENTINEL,
 			expiresAt: recoveredAt + this.retryStateTtlMs,
 		};
 		const markerPath = this.retryRecoveryPath(laneId);
@@ -394,11 +419,26 @@ export class AdaptiveProviderQueue {
 		await fs.writeFile(filePath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
 	}
 
+	private queueOrderFloor(): bigint {
+		return 1n;
+	}
+
+	private async nextQueueOrder(laneDir: string): Promise<bigint> {
+		let order = this.queueOrderFloor();
+		for (const name of await fs.readdir(laneDir)) {
+			const match = /^(\d+)-/.exec(name);
+			if (!match) continue;
+			const existing = BigInt(match[1]);
+			if (existing >= order) order = existing + 1n;
+		}
+		return order;
+	}
+
 	private async createQueueFile(laneId: string, suffix: string): Promise<QueueTicket> {
 		return this.withQueuePublicationLock(laneId, async laneDir => {
-			const monotonic = process.hrtime.bigint().toString().padStart(20, "0");
+			const order = (await this.nextQueueOrder(laneDir)).toString().padStart(20, "0");
 			const sequence = (++ticketSequence).toString().padStart(8, "0");
-			const fileName = `${monotonic}-${process.pid.toString().padStart(10, "0")}-${sequence}-${randomUUID()}${suffix}`;
+			const fileName = `${order}-${process.pid.toString().padStart(10, "0")}-${sequence}-${randomUUID()}${suffix}`;
 			const filePath = path.join(laneDir, fileName);
 			await this.writeQueueFile(filePath, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
 			const ticket: QueueTicket = {
@@ -419,13 +459,41 @@ export class AdaptiveProviderQueue {
 		});
 	}
 
-	private async waitForQueueFileTurn(ticket: QueueTicket, suffix: string, signal?: AbortSignal): Promise<number> {
+	private async stabilizeQueueFront(ticket: QueueTicket, suffix: string): Promise<boolean> {
+		return this.withQueuePublicationLock(ticket.laneId, async laneDir => {
+			const names = await this.listLiveQueueFileNames(ticket.laneId, suffix);
+			if (names[0] !== ticket.fileName) return false;
+			if (ticket.fileName.startsWith(`${STABLE_FRONT_ORDER}-`)) return true;
+
+			const sequence = (++ticketSequence).toString().padStart(8, "0");
+			const fileName = `${STABLE_FRONT_ORDER}-${process.pid.toString().padStart(10, "0")}-${sequence}-${randomUUID()}${suffix}`;
+			const filePath = path.join(laneDir, fileName);
+			await fs.rename(ticket.filePath, filePath);
+			ticket.fileName = fileName;
+			ticket.filePath = filePath;
+			return true;
+		});
+	}
+
+	private async waitForQueueFileTurn(
+		ticket: QueueTicket,
+		suffix: string,
+		signal?: AbortSignal,
+		onPosition?: (position: QueuePosition) => void,
+	): Promise<number> {
+		let lastPosition = -1;
+		let lastDepth = -1;
 		while (true) {
 			if (signal?.aborted) throw abortError();
 			const names = await this.listLiveQueueFileNames(ticket.laneId, suffix);
 			const position = names.indexOf(ticket.fileName);
 			if (position < 0) throw new Error("Adaptive provider queue coordination file disappeared while waiting");
-			if (position === 0) return names.length;
+			if (position !== lastPosition || names.length !== lastDepth) {
+				lastPosition = position;
+				lastDepth = names.length;
+				onPosition?.({ position: position + 1, depth: names.length });
+			}
+			if (position === 0 && (await this.stabilizeQueueFront(ticket, suffix))) return names.length;
 			const jitter = Math.floor(this.pollMs * 0.25 * this.random());
 			await sleepWithSignal(this.pollMs + jitter, signal);
 		}
@@ -457,8 +525,16 @@ export class AdaptiveProviderQueue {
 		return this.createQueueFile(laneId, REQUEST_TICKET_SUFFIX);
 	}
 
-	async waitForTurn(ticket: QueueTicket, signal?: AbortSignal): Promise<number> {
-		return this.waitForQueueFileTurn(ticket, REQUEST_TICKET_SUFFIX, signal);
+	async waitForTurn(
+		ticket: QueueTicket,
+		signal?: AbortSignal,
+		onPosition?: (position: QueuePosition) => void,
+	): Promise<number> {
+		return this.waitForQueueFileTurn(ticket, REQUEST_TICKET_SUFFIX, signal, onPosition);
+	}
+
+	async captureRetryAttempt(laneId: string): Promise<RetryAttemptSnapshot> {
+		return { recoveryGeneration: (await this.readRecoveryMarker(laneId))?.generation };
 	}
 
 	async position(ticket: QueueTicket): Promise<number> {
@@ -555,7 +631,7 @@ export class AdaptiveProviderQueue {
 	async waitForRetryWindow(
 		ticket: QueueTicket,
 		signal?: AbortSignal,
-		requestStartedAt?: RetryAttemptEpoch,
+		requestStartedAt?: RetryAttemptSnapshot,
 	): Promise<RetryWindowDecision> {
 		await this.assertFront(ticket);
 		const decision = await this.withRetryStateLock<RetryWindowDecision>(ticket.laneId, async () => {
@@ -566,9 +642,7 @@ export class AdaptiveProviderQueue {
 					status: "ready",
 					claimed: false,
 					recoveredSinceRequest:
-						recovery !== undefined &&
-						recovery.recoveredAt >= requestStartedAt.wallMs &&
-						BigInt(recovery.recoveredAtNs) > requestStartedAt.monotonicNs,
+						recovery !== undefined && recovery.generation !== requestStartedAt.recoveryGeneration,
 				};
 			}
 			if (state.status === "exhausted") return { status: "exhausted", state };

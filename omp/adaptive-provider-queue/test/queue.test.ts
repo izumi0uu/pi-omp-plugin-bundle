@@ -9,9 +9,9 @@ import {
 	createLaneId,
 	sleepWithSignal,
 	type LaneRetryState,
-	type RetryAttemptEpoch,
 } from "../src/queue.ts";
 import { toOpenAIResponsesModel } from "../src/responses-model.ts";
+import type { AdaptiveRetryProgress } from "../src/retry-progress.ts";
 import {
 	AdaptiveRetryExhaustedError,
 	createAdaptiveStream,
@@ -157,7 +157,8 @@ test("tickets are ordered across queue instances and the next waiter wakes after
 	assert.equal(await firstQueue.waitForTurn(first), 2);
 
 	let secondReachedFront = false;
-	const waiting = secondQueue.waitForTurn(second).then(() => {
+	const positions: Array<{ position: number; depth: number }> = [];
+	const waiting = secondQueue.waitForTurn(second, undefined, position => positions.push(position)).then(() => {
 		secondReachedFront = true;
 	});
 	await sleepWithSignal(30);
@@ -165,8 +166,76 @@ test("tickets are ordered across queue instances and the next waiter wakes after
 	await firstQueue.release(first);
 	await waiting;
 	assert.equal(secondReachedFront, true);
+	assert.deepEqual(positions, [
+		{ position: 2, depth: 2 },
+		{ position: 1, depth: 1 },
+	]);
 	await secondQueue.release(second);
 	assert.equal(await firstQueue.hasWaiters("lane"), false);
+});
+
+test("later tickets stay behind earlier tickets when process-relative clocks run backwards", async () => {
+	const rootDir = await tempRoot();
+	const firstQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	const secondQueue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	(firstQueue as unknown as { queueOrderFloor(): bigint }).queueOrderFloor = () => 200n;
+	(secondQueue as unknown as { queueOrderFloor(): bigint }).queueOrderFloor = () => 100n;
+
+	const first = await firstQueue.acquire("lane");
+	const second = await secondQueue.acquire("lane");
+	assert.ok(first.fileName < second.fileName);
+	assert.equal(await firstQueue.position(first), 0);
+	assert.equal(await secondQueue.position(second), 1);
+	await firstQueue.release(first);
+	await secondQueue.release(second);
+});
+
+test("new queue ordering remains behind a live legacy hrtime ticket", async () => {
+	const rootDir = await tempRoot();
+	const laneDir = path.join(rootDir, "lane");
+	await fs.mkdir(laneDir, { recursive: true });
+	const legacyName = "00000000000000000999-0000000001-00000001-legacy.ticket";
+	await fs.writeFile(path.join(laneDir, legacyName), JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	(queue as unknown as { queueOrderFloor(): bigint }).queueOrderFloor = () => 1n;
+
+	const ticket = await queue.acquire("lane");
+	assert.ok(ticket.fileName > legacyName);
+	await queue.release(ticket);
+	await fs.unlink(path.join(laneDir, legacyName));
+});
+
+test("a stabilized front ticket stays ahead when a legacy process publishes later", async () => {
+	const rootDir = await tempRoot();
+	const laneDir = path.join(rootDir, "lane");
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	(queue as unknown as { queueOrderFloor(): bigint }).queueOrderFloor = () => 200n;
+	const ticket = await queue.acquire("lane");
+	await queue.waitForTurn(ticket);
+	assert.match(ticket.fileName, /^00000000000000000000-/);
+
+	const legacyName = "00000000000000000100-0000000001-00000001-late-legacy.ticket";
+	await fs.writeFile(path.join(laneDir, legacyName), JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+	assert.equal(await queue.position(ticket), 0);
+	await queue.release(ticket);
+	await fs.unlink(path.join(laneDir, legacyName));
+});
+
+test("new waiters use low lane orders so a later legacy ticket stays behind", async () => {
+	const rootDir = await tempRoot();
+	const laneDir = path.join(rootDir, "lane");
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, random: () => 0 });
+	const owner = await queue.acquire("lane");
+	await queue.waitForTurn(owner);
+	const waiter = await queue.acquire("lane");
+
+	const legacyName = "00000000000000000100-0000000001-00000001-late-legacy.ticket";
+	await fs.writeFile(path.join(laneDir, legacyName), JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+	assert.equal(await queue.position(owner), 0);
+	assert.equal(await queue.position(waiter), 1);
+	await queue.release(owner);
+	await queue.release(waiter);
+	await fs.unlink(path.join(laneDir, legacyName));
 });
 
 async function assertQueueFilePublicationIsSerialized(suffix: ".ticket" | ".state-lock"): Promise<void> {
@@ -379,7 +448,7 @@ test("a recovery marker only classifies attempts that started before the success
 	const owner = await queue.acquire("lane");
 	await queue.waitForTurn(owner);
 	await queue.recordRetryFailure(owner, { maxRetries: 50, kind: "rate-limit" });
-	const staleAttempt: RetryAttemptEpoch = { wallMs: Date.now(), monotonicNs: process.hrtime.bigint() };
+	const staleAttempt = await queue.captureRetryAttempt("lane");
 	await queue.clearRetryState(owner);
 	await queue.release(owner);
 
@@ -389,12 +458,53 @@ test("a recovery marker only classifies attempts that started before the success
 	assert.equal(staleWindow.status === "ready" && staleWindow.recoveredSinceRequest, true);
 	await queue.release(staleFollower);
 
-	const freshAttempt: RetryAttemptEpoch = { wallMs: Date.now(), monotonicNs: process.hrtime.bigint() };
+	const freshAttempt = await queue.captureRetryAttempt("lane");
 	const freshFollower = await queue.acquire("lane");
 	await queue.waitForTurn(freshFollower);
 	const freshWindow = await queue.waitForRetryWindow(freshFollower, undefined, freshAttempt);
 	assert.equal(freshWindow.status === "ready" && freshWindow.recoveredSinceRequest, false);
 	await queue.release(freshFollower);
+});
+
+test("version-one recovery markers remain readable during a rolling upgrade", async () => {
+	const rootDir = await tempRoot();
+	const laneDir = path.join(rootDir, "lane");
+	await fs.mkdir(laneDir, { recursive: true });
+	await fs.writeFile(
+		path.join(laneDir, "retry-recovery.json"),
+		JSON.stringify({
+			version: 1,
+			recoveredAt: 123,
+			recoveredAtNs: "456",
+			expiresAt: Date.now() + 60_000,
+		}),
+	);
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10 });
+	assert.equal((await queue.captureRetryAttempt("lane")).recoveryGeneration, "legacy:123:456");
+});
+
+test("new recovery markers remain readable by a version-one process during reload", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, random: () => 0 });
+	const ticket = await queue.acquire("lane");
+	await queue.waitForTurn(ticket);
+	await queue.recordRetryFailure(ticket, { maxRetries: 50, kind: "transport" });
+	const requestStartedAt = { wallMs: Date.now(), monotonicNs: process.hrtime.bigint() };
+	await queue.clearRetryState(ticket);
+
+	const marker = JSON.parse(
+		await fs.readFile(path.join(rootDir, "lane", "retry-recovery.json"), "utf8"),
+	) as { version: unknown; recoveredAt: unknown; recoveredAtNs: unknown; generation: unknown };
+	assert.equal(marker.version, 1);
+	assert.equal(typeof marker.generation, "string");
+	assert.equal(typeof marker.recoveredAtNs, "string");
+	assert.equal(
+		typeof marker.recoveredAt === "number" &&
+			marker.recoveredAt >= requestStartedAt.wallMs &&
+			BigInt(marker.recoveredAtNs as string) > requestStartedAt.monotonicNs,
+		true,
+	);
+	await queue.release(ticket);
 });
 
 test("separate processes share one FIFO retry lane", async () => {
@@ -513,16 +623,28 @@ test("stream wrapper discards pre-content 429 attempts and emits only the succes
 			{ type: "done", reason: "stop", message: succeeded },
 		]),
 	];
+	const progress: Array<AdaptiveRetryProgress | undefined> = [];
+	let progressFailureInjected = false;
 	const output = createAdaptiveStream({
 		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
 		requestOptions: { apiKey: "test" },
 		queue,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => attempts.shift()!,
+		onProgress: value => {
+			progress.push(value);
+			if (value && !progressFailureInjected) {
+				progressFailureInjected = true;
+				throw new Error("temporary retry status failure");
+			}
+		},
 	});
 	await output.completion.promise;
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 	assert.equal(attempts.length, 0);
+	assert.equal(progress.some(value => value?.attempt === 1 && value.kind === "rate-limit"), true);
+	assert.equal(progress.at(-1), undefined);
+	assert.equal(progressFailureInjected, true);
 });
 
 test("successful substantive output clears a retry campaign inherited from another window", async () => {
