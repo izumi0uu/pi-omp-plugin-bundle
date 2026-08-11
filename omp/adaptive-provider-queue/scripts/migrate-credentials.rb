@@ -5,6 +5,9 @@ abort "usage: migrate-credentials.rb MODELS_YML ENV_FILE" unless models_path && 
 
 targets = {
   "aiinput" => "AIINPUT_API_KEY",
+  "aiinput-overseas" => "AIINPUT_API_KEY",
+  "aiinput2" => "AIINPUT2_API_KEY",
+  "aiinput2-overseas" => "AIINPUT2_API_KEY",
   "tokenking-grok" => "TOKENKING_GROK_API_KEY",
 }
 
@@ -25,7 +28,7 @@ current_provider = nil
 resolved = {}
 models_lines = File.readlines(models_path)
 models_lines.map! do |line|
-  provider_match = /\A  ([A-Za-z0-9_-]+):\s*\z/.match(line)
+  provider_match = /\A  ([A-Za-z0-9_-]+):(?:\s+&[A-Za-z0-9_-]+)?\s*\z/.match(line)
   current_provider = provider_match[1] if provider_match
   variable = targets[current_provider]
   key_match = /\A    apiKey:\s*(.*?)\s*\z/.match(line)
@@ -35,6 +38,7 @@ models_lines.map! do |line|
   value = configured == variable ? env_values[variable] : (ENV[configured] || configured)
   abort "missing credential for #{current_provider}" unless value && value.length >= 20
   abort "unsupported credential characters for #{current_provider}" unless /\A[A-Za-z0-9_.-]+\z/.match?(value)
+  abort "credential mismatch for #{variable}" if resolved.key?(variable) && resolved[variable] != value
   resolved[variable] = value
   "    apiKey: #{variable}\n"
 end

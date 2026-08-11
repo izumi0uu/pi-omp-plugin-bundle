@@ -174,6 +174,9 @@ retry:
     aiinput-overseas/*:
       - tokenking-queued/gpt-5.6-sol:max
       - tokenking/gpt-5.6-sol:max
+    aiinput2-overseas-queued/*:
+      - tokenking-queued/gpt-5.6-sol:max
+      - tokenking/gpt-5.6-sol:max
     kimi-code-queued/*:
       - tokenking-queued/gpt-5.6-sol:max
       - tokenking/gpt-5.6-sol:max

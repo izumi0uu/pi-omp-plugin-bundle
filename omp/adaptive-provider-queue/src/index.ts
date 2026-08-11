@@ -198,6 +198,23 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 		],
 	});
 
+	pi.registerProvider("aiinput2-overseas-queued", {
+		baseUrl: "https://input.codes/v1",
+		apiKey: "AIINPUT2_API_KEY",
+		api: QUEUED_RESPONSES_API,
+		models: [
+			{
+				id: "gpt-5.6-sol",
+				name: "GPT 5.6 Sol (AI Input 2 overseas, adaptive queue)",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 372_000,
+				maxTokens: 32_768,
+			},
+		],
+	});
+
 	pi.registerProvider("tokenking-queued", {
 		baseUrl: "https://api.tokenskingdom.com/v1",
 		apiKey: "TOKENKING_API_KEY",

@@ -140,6 +140,7 @@ cooldown behavior and diagnostic commands are recorded in
 |---|---|---|---|
 | `aiinput-queued` | `https://ai.input.im/v1` | `gpt-5.6-sol` | `AIINPUT_API_KEY` |
 | `aiinput-overseas-queued` | `https://input.codes/v1` | `gpt-5.6-sol` | `AIINPUT_API_KEY` |
+| `aiinput2-overseas-queued` | `https://input.codes/v1` | `gpt-5.6-sol` | `AIINPUT2_API_KEY` |
 | `tokenking-queued` | `https://api.tokenskingdom.com/v1` | `gpt-5.6-sol` | `TOKENKING_API_KEY` |
 | `tokenking-grok-queued` | `https://api.tokenskingdom.com/v1` | `grok-4.5` | `TOKENKING_GROK_API_KEY` |
 | `kimi-code-queued` | `https://api.kimi.com/coding/v1` | 7 models: K3, K3-256k, K2.7 Coding, K2.7 Coding Highspeed, K2, K2 Turbo and K2.5 | Stored `kimi-code` login via `!omp token kimi-code --raw` |
@@ -187,6 +188,7 @@ Set credentials in OMP's private environment file:
 
 ```dotenv
 AIINPUT_API_KEY=your-key
+AIINPUT2_API_KEY=your-second-account-key
 TOKENKING_API_KEY=your-key
 TOKENKING_GROK_API_KEY=your-key
 ```
@@ -199,7 +201,10 @@ Do not load this package alongside another copy under `~/.omp/agent/extensions/a
 
 ## Credential migration helper
 
-The optional helper replaces inline credentials for the existing `aiinput` and `tokenking-grok` entries in `models.yml` with environment-variable references and writes the recovered values to `.env` using mode `0600`:
+The optional helper replaces inline credentials for the existing AI Input account 1,
+AI Input account 2 and `tokenking-grok` entries in `models.yml` with
+environment-variable references and writes the recovered values to `.env` using
+mode `0600`:
 
 ```bash
 ruby scripts/migrate-credentials.rb ~/.omp/agent/models.yml ~/.omp/agent/.env

@@ -22,6 +22,10 @@ const retrying: AdaptiveRetryProgress = {
 test("retry progress renders a compact fixed-width ASCII bar", () => {
 	assert.equal(formatRetryProgress(retrying), "TokenKing retry 2/50 [#-----------] transport q1/2");
 	assert.equal(
+		formatRetryProgress({ ...retrying, provider: "aiinput2-overseas-queued" }),
+		"AI Input 2 overseas retry 2/50 [#-----------] transport q1/2",
+	);
+	assert.equal(
 		formatRetryProgress({ ...retrying, phase: "queued", attempt: 0, kind: undefined, queuePosition: 2 }),
 		"TokenKing queued [------------] q2/2",
 	);

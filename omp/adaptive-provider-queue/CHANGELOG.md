@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1 - 2026-08-11
+
+- Register `aiinput2-overseas-queued` for GPT 5.6 Sol on the overseas AI Input
+  endpoint, isolated from account 1 by the `AIINPUT2_API_KEY` credential lane.
+- Extend the credential migration helper to move both AI Input accounts and
+  their domestic/overseas aliases to environment-variable references.
+
 ## 0.5.0 - 2026-08-11
 
 - Make cross-window retry sharing opt-in and default new or unrecorded sessions,
