@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 - 2026-08-11
+
+- Make cross-window retry sharing opt-in and default new or unrecorded sessions,
+  as well as low-level stream calls that omit the option, to isolated
+  request-local recovery.
+- Add `/adaptive-share status|on|off|toggle`, persist the choice in session
+  history, restore it across resume/tree navigation, and keep subagents on the
+  root session's policy.
+- Bypass all ticket, retry-state and recovery-marker operations in isolated
+  mode while retaining the same 50-attempt staged backoff and original-error
+  fallback behavior.
+- Show local retry progress without a queue position and combine the persistent
+  policy status as `5xx: ... | shared: on/off`.
+- Preserve the existing cross-process FIFO implementation behind explicit
+  shared mode. Existing shared files are ignored, not deleted, while sharing is
+  off so older OMP windows are not disrupted during reload.
+
 ## 0.4.2 - 2026-08-11
 
 - Show queued recovery in one replaceable OMP status slot instead of emitting

@@ -19,10 +19,15 @@ import { toOpenAIResponsesModel } from "./responses-model.ts";
 import { sharedRetryStatusController } from "./retry-progress.ts";
 import {
 	ADAPTIVE_5XX_POLICY_ENTRY,
+	ADAPTIVE_SHARE_POLICY_ENTRY,
+	formatAdaptivePolicyStatus,
+	parseSharedRetryRecoveryCommand,
 	parseTransientUpstreamModeCommand,
 	restoreSessionPolicy,
 	sessionPolicyMode,
+	sessionSharedRetryRecovery,
 	setSessionPolicy,
+	setSessionSharedRetryRecovery,
 	sharedSessionPolicyStore,
 	type TransientUpstreamMode,
 } from "./session-policy.ts";
@@ -54,11 +59,15 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			getSessionId(): string;
 		};
 	};
-	const updateStatus = (ctx: SessionContextLike, mode: TransientUpstreamMode) => {
+	const updateStatus = (
+		ctx: SessionContextLike,
+		mode: TransientUpstreamMode,
+		sharedRetryRecovery: boolean,
+	) => {
 		if (!ctx.hasUI) return;
 		ctx.ui.setStatus(
 			"adaptive-provider-queue:5xx",
-			mode === "fallback" ? "5xx: immediate fallback" : "5xx: retry 50x",
+			formatAdaptivePolicyStatus(mode, sharedRetryRecovery),
 		);
 	};
 	const rehydrateSessionPolicy = (ctx: SessionContextLike) => {
@@ -73,10 +82,11 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			lineageSessionId,
 			artifactsDir,
 		});
-		updateStatus(ctx, mode);
+		updateStatus(ctx, mode, sessionSharedRetryRecovery(sessionPolicies, sessionId));
 	};
 	const streamOptions = (options: { sessionId?: string } | undefined) => ({
 		retryTransientUpstream5xx: sessionPolicyMode(sessionPolicies, options?.sessionId) === "retry",
+		sharedRetryRecovery: sessionSharedRetryRecovery(sessionPolicies, options?.sessionId),
 		onProgress: retryStatuses.createReporter(options?.sessionId),
 	});
 
@@ -95,11 +105,36 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				pi.appendEntry(ADAPTIVE_5XX_POLICY_ENTRY, { mode: command });
 			}
 			const mode = sessionPolicyMode(sessionPolicies, sessionId);
-			updateStatus(ctx, mode);
+			const sharedRetryRecovery = sessionSharedRetryRecovery(sessionPolicies, sessionId);
+			updateStatus(ctx, mode, sharedRetryRecovery);
 			ctx.ui.notify(
 				mode === "retry"
-					? "Generic 502/503/504 errors will use the shared 50-attempt retry campaign in this session."
+					? `Generic 502/503/504 errors will use a ${sharedRetryRecovery ? "shared" : "local"} 50-attempt retry budget in this session.`
 					: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
+				"info",
+			);
+		},
+	});
+	pi.registerCommand("adaptive-share", {
+		description: "Choose whether retry recovery state is shared across OMP sessions",
+		handler: (args, ctx) => {
+			const sessionId = ctx.sessionManager.getSessionId();
+			const current = sessionSharedRetryRecovery(sessionPolicies, sessionId);
+			const command = parseSharedRetryRecoveryCommand(args, current);
+			if (command === undefined) {
+				ctx.ui.notify("Usage: /adaptive-share [status|on|off|toggle]", "warning");
+				return;
+			}
+			if (command !== "status") {
+				setSessionSharedRetryRecovery(sessionPolicies, sessionId, command);
+				pi.appendEntry(ADAPTIVE_SHARE_POLICY_ENTRY, { enabled: command });
+			}
+			const enabled = sessionSharedRetryRecovery(sessionPolicies, sessionId);
+			updateStatus(ctx, sessionPolicyMode(sessionPolicies, sessionId), enabled);
+			ctx.ui.notify(
+				enabled
+					? "Retry recovery will share queue state across OMP sessions."
+					: "Retry recovery will use an isolated local retry budget.",
 				"info",
 			);
 		},

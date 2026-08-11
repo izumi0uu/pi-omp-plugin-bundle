@@ -5,10 +5,11 @@
 ## 目标
 
 - 正常请求不设置固定并发上限。
-- 真实请求返回限流或可恢复的传输错误时才进入 FIFO 队列。
+- 真实请求返回限流或可恢复的传输错误时，默认在当前请求内独立重试，不创建共享队列。
 - 临时上游 `502/503/504`、`server_is_overloaded`、`stream_read_error`、超时、连接断开和不完整流与限流共享
-  50 次预算；同一 endpoint + credential lane 的所有窗口共享这一份预算，避免瞬时服务
-  拥塞或传输波动过早触发 fallback。
+  当前请求的 50 次预算，避免瞬时服务拥塞或传输波动过早触发 fallback。
+- 跨窗口 FIFO 和共享恢复预算保留为 session 级可选模式，默认关闭；需要时才让同一
+  endpoint + credential lane 的窗口共享一次恢复活动。
 - 允许单个 session 把普通 HTTP `502/503/504` 改为首次失败后立即进入 OMP fallback，
   不改变并发限流、明确服务器过载、断流、鉴权、额度和模型不可用的既有路由。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
@@ -26,10 +27,10 @@ modelRoles:
   perplexity: tokenking-grok-queued/grok-4.5:high
 ```
 
-`default`、`slow`、`plan` 和 `designer` 都使用 adaptive queue transport。主模型在
+`default`、`slow`、`plan` 和 `designer` 都使用 adaptive retry transport。主模型在
 输出正文、tool call 或图片前遇到限流、明确的临时服务器过载或可恢复传输错误时，会
 执行同一套 50 次分段重试；遇到鉴权、额度、明确的模型不可用或其他非瞬态错误时才立即
-进入 fallback。手动选择普通 `aiinput` 或 `kimi-code` 会绕过这套内部队列并采用
+进入 fallback。手动选择普通 `aiinput` 或 `kimi-code` 会绕过这套内部重试并采用
 fail-fast 行为，与 queued selector 不会自动互换。
 
 ## 重试归属
@@ -51,9 +52,32 @@ retry:
 | 31-40 | 每次 3 分钟 |
 | 41-50 | 每次 5 分钟封顶 |
 
-限流和可恢复传输错误共享同一个计数器，不会分别获得两套预算。只有 thinking 的流
+限流和可恢复传输错误共享当前请求的同一个计数器，不会分别获得两套预算。只有 thinking 的流
 仍可重试，后续尝试会抑制重复的 thinking 和 stream envelope；一旦已经输出正文、
-tool call 或图片，就不重放。手动取消会立即中断等待，但不会清空正在恢复的 lane 状态。
+tool call 或图片，就不重放。手动取消会立即中断等待；默认隔离模式没有需要保留的 lane 状态。
+
+### Session 级共享恢复开关
+
+```text
+/adaptive-share status
+/adaptive-share on
+/adaptive-share off
+/adaptive-share toggle
+```
+
+- 新 session、没有共享策略记录的旧 session、`/new` 都默认为 `off`。
+- `off` 时，每个请求独立拥有 50 次计数和退避，不读取或写入 ticket、retry-state、
+  recovery marker；多个窗口互不等待，也不会触发共享队首断言。
+- `on` 时，才启用同一 endpoint + credential lane 的跨进程 FIFO、共享 50 次预算、
+  唯一恢复探针和 5 分钟共享 exhaustion 缓存。
+- 选择写入当前 session JSONL；`/resume`、branch/tree 恢复和 root/subagent lineage 都会
+  恢复该选择。
+- 开关在每个请求开始时取值。切换不会迁移或中断已经运行的请求，只影响后续请求。
+- `off` 不删除旧窗口仍可能使用的共享状态文件；关闭时忽略它们。若其过期前重新打开，
+  新请求可能继续观察到该共享活动或 exhaustion 缓存。
+- 状态栏合并显示两个策略，例如 `5xx: retry 50x | shared: off`。
+- 本地重试进度不显示队列位置：`TokenKing retry 2/50 [#-----------] transport`。
+  共享模式才追加 `q1/2` 等 FIFO 位置。
 
 ### Session 级普通 5xx 开关
 
@@ -64,17 +88,16 @@ tool call 或图片，就不重放。手动取消会立即中断等待，但不�
 /adaptive-5xx toggle
 ```
 
-- 新 session 默认为 `retry`，普通 `502/503/504` 使用共享 50 次预算。
+- 新 session 默认为 `retry`，普通 `502/503/504` 使用当前选择的本地或共享 50 次预算。
 - `fallback` 模式下，普通 `502/503/504` 的首次失败直接交给 OMP fallback。
 - 选择写入当前 session JSONL；`/resume` 会恢复。fork 的活动分支包含该记录时会继承。
 - `/new` 没有旧记录，因此回到默认 `retry`。
 - root session 创建的 subagent 沿用 root 当前模式。
 - detached 或嵌套 subagent 会按稳定的 artifacts lineage 绑定原 root；即使 UI 后来
   switch 到另一个 session，也不会改用新 session 的策略。
-- 两种模式都持续显示在状态栏：`5xx: retry 50x` 或 `5xx: immediate fallback`。
-- 实际进入共享恢复后，同一个可覆盖的状态槽会显示 provider、`attempt/50` 进度条、
-  错误类型和队列位置，例如
-  `TokenKing retry 2/50 [#-----------] transport q1/2`；成功、取消或最终失败后清除，
+- 两种模式都与共享开关一起持续显示在状态栏。
+- 实际进入恢复后，同一个可覆盖的状态槽会显示 provider、`attempt/50` 进度条和错误类型；
+  共享模式还显示队列位置。成功、取消或最终失败后清除，
   不会为每次重试叠加通知。只有携带当前交互 session ID 的请求能写入该槽位；
   detached/nested subagent 与缺失 session ID 的后台请求都不抢占 root 窗口的进度。
 - `/tree` 跳转到其他历史节点时，会按新活动分支重新恢复策略。
@@ -83,7 +106,7 @@ tool call 或图片，就不重放。手动取消会立即中断等待，但不�
   server overload 同时带有 `502/503/504`，这些仍重试。
 - 开关也不影响鉴权、额度、billing、明确 model unavailable；这些仍立即交给 fallback。
 
-如果同一 endpoint + credential lane 的其他窗口正在执行普通 5xx 恢复活动，
+以下协调行为只在 `/adaptive-share on` 时存在。如果同一 endpoint + credential lane 的其他窗口正在执行普通 5xx 恢复活动，
 `fallback` session 不加入这份活动，也不会把它标记为 `exhausted`。它独立请求一次，
 若仍得到普通 5xx，就只让当前 session 进入 OMP fallback。
 如果这次独立请求成功，它会清除自己开始请求时观察到的恢复活动；若其他窗口已把
@@ -106,6 +129,7 @@ owner；旧格式 ticket 可以安全共存。所有旧窗口完成 `/reload` �
 
 ### 跨窗口恢复状态
 
+- 仅在当前 session 为 `/adaptive-share on` 时启用。
 - 健康 lane 不限制初始并发；只有真实请求失败后才创建共享恢复状态。
 - 每个 endpoint + credential lane 只有一份 50 次恢复预算，FIFO 队首是唯一探针，
   其余窗口只排队等待。
@@ -118,17 +142,18 @@ owner；旧格式 ticket 可以安全共存。所有旧窗口完成 `/reload` �
 
 | 错误 | 行为 |
 |---|---|
-| 输出正文/tool/image 前的 `429`、concurrency、rate limit | 排队并使用共享 50 次预算 |
-| 普通上游 `502/503/504`，session 为默认 `retry` | 排队并使用共享 50 次预算 |
+| 输出正文/tool/image 前的 `429`、concurrency、rate limit | 使用当前选择的本地/共享 50 次预算 |
+| 普通上游 `502/503/504`，session 为默认 `retry` | 使用当前选择的本地/共享 50 次预算 |
 | 普通上游 `502/503/504`，session 为 `fallback` | 首次失败直接交给 OMP fallback |
-| 明确的 `server_is_overloaded` 同义响应 | 两种 session 模式都排队并使用共享 50 次预算 |
-| 输出正文/tool/image 前的 `stream_read_error`、timeout、socket/fetch/network failure、不完整流 | 排队并使用共享 50 次预算 |
+| 明确的 `server_is_overloaded` 同义响应 | 两种 5xx 模式都使用当前选择的本地/共享 50 次预算 |
+| 输出正文/tool/image 前的 `stream_read_error`、timeout、socket/fetch/network failure、不完整流 | 使用当前选择的本地/共享 50 次预算 |
 | `401`、`403`、token revoked | 立即交给 OMP fallback |
 | quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
 | model unavailable、no capacity、其他非瞬态 `5xx` | 立即交给 OMP fallback |
 | 已产生文本、tool call 或图片后的错误 | 不重放，直接结束当前流 |
-| queued provider 的第 50 次重试仍失败 | 把最后一次错误交给 OMP fallback，并缓存 lane exhaustion 5 分钟 |
-| lane exhaustion 缓存期间的新请求或等待者 | 不访问上游，直接交给 OMP fallback |
+| 隔离模式第 50 次重试仍失败 | 把最后一次原始错误交给 OMP fallback，不保留共享状态 |
+| 共享模式第 50 次重试仍失败 | 把最后一次错误交给 OMP fallback，并缓存 lane exhaustion 5 分钟 |
+| 共享 lane exhaustion 缓存期间的新请求或等待者 | 不访问上游，直接交给 OMP fallback |
 
 ## Fallback Chain
 
@@ -164,14 +189,15 @@ retry:
 ```
 
 `kimi-code-queued/*` 复用 OMP 内置 `kimi-code` 登录保存的凭据，但请求经过 adaptive
-queue transport，并参与同一 endpoint + credential lane 的共享恢复活动。内置
+retry transport；只有 session 执行 `/adaptive-share on` 后才参与同一 endpoint +
+credential lane 的共享恢复活动。内置
 `kimi-code/*` selector 绕过插件队列，仍使用 OMP 的直接 transport；两者指向同一
 Kimi Code 服务，不是相互独立的供应商或账号。
 
 两个 TokenKing selector 使用相同的 `TOKENKING_API_KEY` 和
 `https://api.tokenskingdom.com/v1`：
 
-1. `tokenking-queued` 先使用 adaptive queue transport。
+1. `tokenking-queued` 先使用 adaptive retry transport；默认同样是本地 50 次预算。
 2. 它失败并进入 selector 冷却后，普通 `tokenking` 仍可执行一次 OMP 原生
    Responses transport 请求。
 
@@ -181,9 +207,10 @@ Kimi Code 服务，不是相互独立的供应商或账号。
 
 ## 冷却与恢复
 
-插件自身的 lane exhaustion 会缓存 5 分钟，用于让同一故障域的所有窗口停止探测并快速
-进入 fallback。它与下面的 OMP selector 冷却是两套独立状态：前者属于插件、按
-endpoint + credential lane 共享；后者属于 OMP、按 model selector 管理。
+只有共享模式的 lane exhaustion 会缓存 5 分钟，用于让同一故障域的所有共享窗口停止
+探测并快速进入 fallback。默认隔离模式预算耗尽后不写 exhaustion 状态。共享缓存与下面
+的 OMP selector 冷却是两套独立状态：前者属于插件、按 endpoint + credential lane
+共享；后者属于 OMP、按 model selector 管理。
 
 OMP 会抑制刚失败的 model selector。错误没有明确 `Retry-After` 且分类未知时，
 抑制窗口通常约为 5 分钟。`fallbackRevertPolicy: cooldown-expiry` 会在主 selector
@@ -222,6 +249,7 @@ omp models kimi-code-queued --json
 
 ```text
 /adaptive-5xx status
+/adaptive-share status
 ```
 
 预期结果：
@@ -230,10 +258,12 @@ omp models kimi-code-queued --json
 - `retry.modelFallback` 为 `true`。
 - `retry.fallbackRevertPolicy` 为 `cooldown-expiry`。
 - queued provider 仍在各自扩展内保持 `maxRetries: 50`。
+- `shared` 默认为 `off`；状态栏预期包含 `shared: off`。
 - `kimi-code-queued` 列出 7 个模型，并复用内置 `kimi-code` 登录凭据。
 
 `Retry failed after 0 attempts` 表示 OMP 外层没有追加重试，通常意味着当前 fallback
 chain 已耗尽、候选处于冷却或候选不可用；它不表示 queued provider 的内部 50 次预算
 被执行完。
 
-修改配置或 extension 后，应重新启动已有 OMP CLI 进程。
+修改配置或 extension 后，每个已经打开的 OMP 窗口都要执行 `/reload`。不需要关闭
+Terminal；磁盘文件更新不会替换窗口里已经加载的旧 JavaScript 模块。

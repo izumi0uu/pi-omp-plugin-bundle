@@ -1,6 +1,7 @@
 import {
 	AdaptiveProviderQueue,
 	createLaneId,
+	sleepWithSignal,
 	type LaneRetryState,
 	type QueuePosition,
 	type QueueTicket,
@@ -44,6 +45,7 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	queue: AdaptiveProviderQueue;
 	maxRetries?: number;
 	retryTransientUpstream5xx?: boolean;
+	sharedRetryRecovery?: boolean;
 	createOutputStream(): TOutput;
 	createInputStream(): InputStreamLike;
 	logger?: QueueLogger;
@@ -147,7 +149,7 @@ export function retryAfterMsFromError(error: unknown): number | undefined {
 }
 
 async function releaseTicket(queue: AdaptiveProviderQueue, ticket: QueueTicket | undefined): Promise<undefined> {
-	await queue.release(ticket);
+	if (ticket) await queue.release(ticket);
 	return undefined;
 }
 
@@ -193,6 +195,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 	const signal = options.requestOptions?.signal;
 	const maxRetries = Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES));
 	const retryTransientUpstream5xx = options.retryTransientUpstream5xx ?? true;
+	const sharedRetryRecovery = options.sharedRetryRecovery ?? false;
 	const laneId = createLaneId({
 		provider: options.model.provider,
 		baseUrl: options.model.baseUrl,
@@ -206,6 +209,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		let emittedStart = false;
 		let emittedTextStart = false;
 		let emittedThinking = false;
+		let localRetryAttempt = 0;
 		let progressAttempt = 0;
 		let progressMaxRetries = maxRetries;
 		let progressKind: RetryFailureKind | undefined;
@@ -260,10 +264,9 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 			}
 		};
 		try {
-			const [hasWaiters, retryState] = await Promise.all([
-				options.queue.hasWaiters(laneId),
-				options.queue.getRetryState(laneId),
-			]);
+			const [hasWaiters, retryState] = sharedRetryRecovery
+				? await Promise.all([options.queue.hasWaiters(laneId), options.queue.getRetryState(laneId)])
+				: [false, undefined] as const;
 			updateProgressState(retryState);
 			const bypassActiveUpstreamCampaign =
 				!retryTransientUpstream5xx &&
@@ -274,10 +277,12 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				ticket = await options.queue.acquire(laneId);
 			}
 			const clearObservedRetryState = async () => {
-				if (ticket) {
-					await options.queue.clearRetryState(ticket);
-				} else if (bypassedRetryState) {
-					await options.queue.clearRetryStateSnapshot(laneId, bypassedRetryState);
+				if (sharedRetryRecovery) {
+					if (ticket) {
+						await options.queue.clearRetryState(ticket);
+					} else if (bypassedRetryState) {
+						await options.queue.clearRetryStateSnapshot(laneId, bypassedRetryState);
+					}
 				}
 				bypassedRetryState = undefined;
 				clearProgress();
@@ -351,11 +356,53 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				};
 				const bypassesUpstreamRetry = (error: unknown): boolean =>
 					!retryTransientUpstream5xx && isAdaptiveTransientUpstream(error);
+				const waitForLocalRetry = async (
+					error: unknown,
+					kind: "rate-limit" | "transport",
+				): Promise<boolean> => {
+					const retryAfterMs = retryAfterMsFromError(error);
+					if (localRetryAttempt >= maxRetries) {
+						progressAttempt = localRetryAttempt;
+						progressMaxRetries = maxRetries;
+						progressKind = kind;
+						progressPosition = undefined;
+						publishProgress("backoff");
+						options.logger?.warn?.("adaptive provider isolated retry limit reached", {
+							provider: options.model.provider,
+							model: options.model.id,
+							kind,
+							attempt: localRetryAttempt,
+							maxRetries,
+						});
+						return false;
+					}
+
+					localRetryAttempt += 1;
+					const delayMs = options.queue.backoffDelayMs(localRetryAttempt, retryAfterMs);
+					progressAttempt = localRetryAttempt;
+					progressMaxRetries = maxRetries;
+					progressKind = kind;
+					progressPosition = undefined;
+					publishProgress("backoff");
+					options.logger?.warn?.("adaptive provider isolated retry caught retryable error", {
+						provider: options.model.provider,
+						model: options.model.id,
+						kind,
+						attempt: localRetryAttempt,
+						maxRetries,
+						delayMs,
+					});
+					await sleepWithSignal(delayMs, signal);
+					publishProgress("requesting");
+					replayCount += 1;
+					return true;
+				};
 				const waitForRetry = async (
 					error: unknown,
 					kind: "rate-limit" | "transport",
 					attemptStartedAt: RetryAttemptSnapshot,
 				): Promise<boolean> => {
+					if (!sharedRetryRecovery) return waitForLocalRetry(error, kind);
 					let joinedBehindAnotherRequest = false;
 					if (!ticket) {
 						ticket = await options.queue.acquire(laneId);
@@ -433,7 +480,9 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					return true;
 				};
 
-				const attemptStartedAt = await options.queue.captureRetryAttempt(laneId);
+				const attemptStartedAt = sharedRetryRecovery
+					? await options.queue.captureRetryAttempt(laneId)
+					: {};
 				try {
 					const input = options.createInputStream();
 					for await (const event of input) {
@@ -508,13 +557,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 			if (!output.done) output.fail(error);
 		} finally {
 			clearProgress();
-			await options.queue.release(ticket).catch(error => {
-				options.logger?.warn?.("adaptive provider queue failed to release ticket", {
-					provider: options.model.provider,
-					model: options.model.id,
-					error: error instanceof Error ? error.message : String(error),
+			if (ticket) {
+				await options.queue.release(ticket).catch(error => {
+					options.logger?.warn?.("adaptive provider queue failed to release ticket", {
+						provider: options.model.provider,
+						model: options.model.id,
+						error: error instanceof Error ? error.message : String(error),
+					});
 				});
-			});
+			}
 		}
 	})();
 

@@ -1,17 +1,20 @@
 export const ADAPTIVE_5XX_POLICY_ENTRY = "adaptive-provider-queue:5xx-policy";
+export const ADAPTIVE_SHARE_POLICY_ENTRY = "adaptive-provider-queue:share-policy";
 export const DEFAULT_TRANSIENT_UPSTREAM_MODE = "retry" as const;
+export const DEFAULT_SHARED_RETRY_RECOVERY = false;
 
 export type TransientUpstreamMode = "retry" | "fallback";
 
 export interface SessionPolicyStore {
-	readonly version: 2;
+	readonly version: 3;
 	readonly modes: Map<string, TransientUpstreamMode>;
+	readonly sharedRetryRecovery: Map<string, boolean>;
 	readonly rootSessionIds: Map<string, string>;
 	readonly rootSessionIdsByArtifactsDir: Map<string, string>;
 	activeInteractiveSessionId?: string;
 }
 
-const SHARED_SESSION_POLICY_STORE = Symbol.for("omp.adaptive-provider-queue.5xx-policy.v2");
+const SHARED_SESSION_POLICY_STORE = Symbol.for("omp.adaptive-provider-queue.session-policy.v3");
 
 interface SessionEntryLike {
 	type?: unknown;
@@ -23,6 +26,12 @@ function modeFromData(data: unknown): TransientUpstreamMode | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const mode = (data as Record<string, unknown>).mode;
 	return mode === "retry" || mode === "fallback" ? mode : undefined;
+}
+
+function sharedRetryRecoveryFromData(data: unknown): boolean | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const enabled = (data as Record<string, unknown>).enabled;
+	return typeof enabled === "boolean" ? enabled : undefined;
 }
 
 export function recordedTransientUpstreamMode(entries: readonly unknown[]): TransientUpstreamMode | undefined {
@@ -39,10 +48,25 @@ export function transientUpstreamModeFromEntries(entries: readonly unknown[]): T
 	return recordedTransientUpstreamMode(entries) ?? DEFAULT_TRANSIENT_UPSTREAM_MODE;
 }
 
+export function recordedSharedRetryRecovery(entries: readonly unknown[]): boolean | undefined {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index] as SessionEntryLike | undefined;
+		if (entry?.type !== "custom" || entry.customType !== ADAPTIVE_SHARE_POLICY_ENTRY) continue;
+		const enabled = sharedRetryRecoveryFromData(entry.data);
+		if (enabled !== undefined) return enabled;
+	}
+	return undefined;
+}
+
+export function sharedRetryRecoveryFromEntries(entries: readonly unknown[]): boolean {
+	return recordedSharedRetryRecovery(entries) ?? DEFAULT_SHARED_RETRY_RECOVERY;
+}
+
 export function createSessionPolicyStore(): SessionPolicyStore {
 	return {
-		version: 2,
+		version: 3,
 		modes: new Map<string, TransientUpstreamMode>(),
+		sharedRetryRecovery: new Map<string, boolean>(),
 		rootSessionIds: new Map<string, string>(),
 		rootSessionIdsByArtifactsDir: new Map<string, string>(),
 	};
@@ -52,8 +76,9 @@ function isSessionPolicyStore(value: unknown): value is SessionPolicyStore {
 	if (!value || typeof value !== "object") return false;
 	const candidate = value as Partial<SessionPolicyStore>;
 	return (
-		candidate.version === 2 &&
+		candidate.version === 3 &&
 		candidate.modes instanceof Map &&
+		candidate.sharedRetryRecovery instanceof Map &&
 		candidate.rootSessionIds instanceof Map &&
 		candidate.rootSessionIdsByArtifactsDir instanceof Map
 	);
@@ -91,8 +116,10 @@ export function restoreSessionPolicy(
 	}
 
 	const recorded = recordedTransientUpstreamMode(input.entries);
+	const recordedSharedRecovery = recordedSharedRetryRecovery(input.entries);
 	if (rootSessionId === input.sessionId) {
 		store.modes.set(rootSessionId, recorded ?? DEFAULT_TRANSIENT_UPSTREAM_MODE);
+		store.sharedRetryRecovery.set(rootSessionId, recordedSharedRecovery ?? DEFAULT_SHARED_RETRY_RECOVERY);
 	}
 	if (input.hasUI) store.activeInteractiveSessionId = input.sessionId;
 	return sessionPolicyMode(store, input.sessionId);
@@ -104,6 +131,14 @@ export function setSessionPolicy(
 	mode: TransientUpstreamMode,
 ): void {
 	store.modes.set(store.rootSessionIds.get(sessionId) ?? sessionId, mode);
+}
+
+export function setSessionSharedRetryRecovery(
+	store: SessionPolicyStore,
+	sessionId: string,
+	enabled: boolean,
+): void {
+	store.sharedRetryRecovery.set(store.rootSessionIds.get(sessionId) ?? sessionId, enabled);
 }
 
 export function sessionPolicyMode(
@@ -121,6 +156,22 @@ export function sessionPolicyMode(
 	return DEFAULT_TRANSIENT_UPSTREAM_MODE;
 }
 
+export function sessionSharedRetryRecovery(
+	store: SessionPolicyStore,
+	sessionId: string | undefined,
+): boolean {
+	if (sessionId) {
+		const rootSessionId = store.rootSessionIds.get(sessionId) ?? sessionId;
+		if (store.sharedRetryRecovery.has(rootSessionId)) {
+			return store.sharedRetryRecovery.get(rootSessionId) ?? DEFAULT_SHARED_RETRY_RECOVERY;
+		}
+	}
+	if (store.activeInteractiveSessionId) {
+		return store.sharedRetryRecovery.get(store.activeInteractiveSessionId) ?? DEFAULT_SHARED_RETRY_RECOVERY;
+	}
+	return DEFAULT_SHARED_RETRY_RECOVERY;
+}
+
 export function parseTransientUpstreamModeCommand(
 	args: string,
 	current: TransientUpstreamMode,
@@ -130,4 +181,24 @@ export function parseTransientUpstreamModeCommand(
 	if (action === "retry" || action === "fallback") return action;
 	if (action === "toggle") return current === "retry" ? "fallback" : "retry";
 	return undefined;
+}
+
+export function parseSharedRetryRecoveryCommand(
+	args: string,
+	current: boolean,
+): boolean | "status" | undefined {
+	const action = args.trim().toLowerCase();
+	if (!action || action === "status") return "status";
+	if (action === "on") return true;
+	if (action === "off") return false;
+	if (action === "toggle") return !current;
+	return undefined;
+}
+
+export function formatAdaptivePolicyStatus(
+	mode: TransientUpstreamMode,
+	sharedRetryRecovery: boolean,
+): string {
+	const upstream = mode === "fallback" ? "5xx: immediate fallback" : "5xx: retry 50x";
+	return `${upstream} | shared: ${sharedRetryRecovery ? "on" : "off"}`;
 }

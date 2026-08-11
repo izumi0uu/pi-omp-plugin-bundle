@@ -1,6 +1,6 @@
 # Adaptive Provider Queue for OMP
 
-OMP 原生 provider extension。正常状态不设置固定并发上限；上游返回可重试的限流或传输错误后，才为同一 endpoint + API key 建立跨 OMP 进程共享的 FIFO 队列。
+OMP 原生 provider extension。正常状态不设置固定并发上限；上游返回可重试的限流或传输错误后，默认由每个请求独立执行分段重试。跨 OMP 进程的 FIFO 队列和共享恢复预算是显式可选功能，默认关闭。
 
 ## Behavior
 
@@ -8,18 +8,41 @@ OMP 原生 provider extension。正常状态不设置固定并发上限；上游
 OMP request
   -> send immediately when no backlog exists
   -> retryable rate-limit or transport failure before text/tool/image output
-  -> join credential-scoped FIFO lane
-  -> share one cross-process 50-retry campaign with staged backoff
+  -> use one request-local 50-retry budget with staged backoff
+  -> forward the final provider error to OMP fallback after exhaustion
+
+Optional shared mode
+  -> join a credential-scoped FIFO lane after a retryable failure
+  -> share one cross-process 50-retry campaign
   -> let only the FIFO head probe recovery
-  -> clear state and release the lane after recovery is observed
+  -> clear shared state after recovery is observed
 ```
 
 Concurrency/rate-limit errors, temporary upstream `502/503/504` responses and
 transient transport failures such as `stream_read_error`, timeouts, reset
-sockets, incomplete streams or failed fetches consume the same retry counter
-and use the same pacing. Thinking-only output may be retried without duplicating the
+sockets, incomplete streams or failed fetches consume the same request-local
+retry counter and use the same pacing. Thinking-only output may be retried without duplicating the
 thinking block; once text, a tool call or an image has been emitted, the stream
 is never replayed.
+
+Cross-window sharing can be changed for the current session:
+
+```text
+/adaptive-share status
+/adaptive-share on
+/adaptive-share off
+/adaptive-share toggle
+```
+
+New sessions default to `off`. In this isolated mode, each request owns its own
+counter and delay schedule and never reads or writes queue tickets, retry state
+or recovery markers. `on` restores the credential-scoped FIFO and shared
+campaign behavior. The choice is stored in session history, restored by
+`/resume`, and inherited by subagents through the root session lineage. It is
+captured when a request starts, so changing it does not migrate an already
+running retry campaign. Shared state left by another or older window is ignored
+while sharing is off and is not deleted; it can be observed again if sharing is
+turned on before that state expires.
 
 Generic HTTP `502/503/504` handling can be changed for the current session:
 
@@ -34,16 +57,16 @@ New sessions default to `retry`. `fallback` forwards a generic `502/503/504`
 after the first failed request so OMP can traverse its model fallback chain.
 The choice is stored in the session, restored by `/resume`, and inherited by a
 fork whose active branch contains the policy entry. The status bar displays
-`5xx: retry 50x` or `5xx: immediate fallback`, so the effective choice remains
-visible after the command notification closes. Subagents created by the session
+both choices, for example `5xx: retry 50x | shared: off`, so the effective
+behavior remains visible after the command notification closes. Subagents created by the session
 use that root session's current choice, including detached and nested subagents
 that outlive a later root-session switch. Policy lookup is keyed by request
 session and stable artifact lineage, so a subagent reloading the provider cannot
 replace or migrate the root policy.
 
-This switch is intentionally narrow. Explicit concurrency/rate-limit or
+The 5xx switch is intentionally narrow. Explicit concurrency/rate-limit or
 `server_is_overloaded` failures, even when accompanied by `502/503/504`, status-less transport failures and
-`stream_read_error` still use the shared retry campaign in both modes.
+`stream_read_error` still use the selected local or shared retry campaign in both modes.
 Authentication, quota, billing and explicit model-unavailable failures still
 pass through immediately in both modes.
 
@@ -60,26 +83,26 @@ turn into a rapid retry storm:
 | After 50 | Forward the last retryable error to OMP fallback |
 
 A small positive jitter remains on staged delays to avoid synchronized retries,
-but no wait can exceed five minutes. The queue head is the only recovery probe;
-other OMP windows wait instead of starting their own retry campaigns. Text, a
-tool call, an image or successful completion clears shared state. Exhaustion or
-a terminal pre-content probe failure remains cached for five minutes, so queued
-and newly arriving requests reach OMP fallback without contacting upstream.
-Cancellation interrupts the current wait and releases its ticket, while the
-next live queue head can claim the active campaign without resetting its count
-or retry deadline.
+but no wait can exceed five minutes. In default isolated mode, cancellation only
+ends that request's wait and no state survives it. In optional shared mode, the
+queue head is the only recovery probe; other OMP windows wait instead of
+starting their own campaigns. Text, a tool call, an image or successful
+completion clears shared state. Exhaustion or a terminal pre-content probe
+failure remains cached for five minutes, so queued and newly arriving shared
+requests reach OMP fallback without contacting upstream. The next live queue
+head can claim an active campaign without resetting its count or retry deadline.
 
 Interactive root sessions expose retry activity through one replaceable status
 slot rather than notifications that accumulate in the transcript. A typical
 status is:
 
 ```text
-TokenKing retry 2/50 [#-----------] transport q1/2
+TokenKing retry 2/50 [#-----------] transport
 ```
 
-The bar and exact counter follow the shared lane budget; `q1/2` means this
-window is first among two live tickets. The same status key is updated as the
-attempt or queue position changes and is cleared after substantive output,
+The bar and exact counter follow the request-local budget. Shared mode adds a
+queue position such as `q1/2`, meaning this window is first among two live
+tickets. The same status key is updated as the attempt or queue position changes and is cleared after substantive output,
 successful completion, cancellation or terminal failure. Detached and nested
 subagents do not overwrite the active root window's progress status. Requests
 without an explicit session ID are treated as background work and cannot write
@@ -98,17 +121,18 @@ cooldown behavior and diagnostic commands are recorded in
 
 | Failure | Action |
 |---|---|
-| Concurrency/rate-limit 429 before text/tool/image | Queue and retry, shared 50-attempt budget |
-| Generic upstream `502/503/504` in the default session mode | Queue and retry, shared 50-attempt budget |
+| Concurrency/rate-limit 429 before text/tool/image | Retry with the selected local/shared 50-attempt budget |
+| Generic upstream `502/503/504` in the default session mode | Retry with the selected local/shared 50-attempt budget |
 | Generic upstream `502/503/504` after `/adaptive-5xx fallback` | Forward to OMP fallback after one request |
-| Explicit server overload | Queue and retry, shared 50-attempt budget in either session mode |
-| Stream/connection transport error before text/tool/image | Queue and retry, shared 50-attempt budget |
+| Explicit server overload | Retry with the selected local/shared 50-attempt budget in either 5xx mode |
+| Stream/connection transport error before text/tool/image | Retry with the selected local/shared 50-attempt budget |
 | 429 quota, credits or billing exhausted | Forward to OMP fallback |
 | 401/403 authentication failure | Forward to OMP fallback |
 | Model unavailable, no capacity or other generic 5xx | Forward to OMP fallback |
 | Error after text, tool call or image output | Forward unchanged; never replay partial output |
-| 50th queued retry still fails | Forward to OMP fallback and cache lane exhaustion for five minutes |
-| New request while lane exhaustion is cached | Forward to OMP fallback without contacting upstream |
+| 50th isolated retry still fails | Forward the final provider error to OMP fallback |
+| 50th shared retry still fails | Forward to OMP fallback and cache lane exhaustion for five minutes |
+| Shared request while lane exhaustion is cached | Forward to OMP fallback without contacting upstream |
 
 ## Registered providers
 
@@ -191,7 +215,7 @@ npm run pack:check
 ```
 
 The tests cover error classification, session policy restoration, generic 5xx
-mode switching, retry progress lifecycle, reverse cross-process clocks, legacy
+and shared-recovery mode switching, fully isolated local retries, retry progress lifecycle, reverse cross-process clocks, legacy
 ticket compatibility, retry-after parsing, Responses compatibility, Kimi
 credential and model adaptation, cancellation, stale ticket cleanup, replay
 boundaries, shared retry counters, exhaustion propagation, success clearing
@@ -207,7 +231,9 @@ and owner takeover between separate processes.
 
 ## Runtime state
 
-Tickets default to `~/.omp/run/adaptive-provider-queue/`. Lane directories are
+When `/adaptive-share on` is active, tickets default to
+`~/.omp/run/adaptive-provider-queue/`. Default isolated requests do not create,
+read or update this runtime state. Shared lane directories are
 created with `0700`; ticket files use `0600`. Each endpoint + credential lane
 may also contain one `retry-state.json`, written as a mode-`0600` temporary file
 and atomically replaced. It records only active/exhausted status, shared attempt
@@ -225,7 +251,9 @@ order under that same publication lock; this keeps a still-running older OMP
 process from displacing the active owner during a rolling reload. Recovery
 markers retain a version-1-compatible envelope so both old and new readers can
 observe success. Strict FIFO between all waiters requires `/reload` in every
-OMP window that still has a pre-0.4.2 extension instance in memory.
+OMP window that still has a pre-0.4.2 extension instance in memory. Every open
+OMP window must run `/reload` after an extension update; closing Terminal is not
+required.
 
 ## License
 

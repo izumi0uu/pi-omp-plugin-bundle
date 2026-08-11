@@ -606,6 +606,215 @@ function assistant(overrides: Record<string, unknown> = {}) {
 	return { stopReason: "error", content: [], ...overrides };
 }
 
+function rejectSharedRetryCalls(queue: AdaptiveProviderQueue): string[] {
+	const calls: string[] = [];
+	const methods = [
+		"hasWaiters",
+		"getRetryState",
+		"acquire",
+		"position",
+		"waitForTurn",
+		"captureRetryAttempt",
+		"waitForRetryWindow",
+		"recordRetryFailure",
+		"markRetryStateExhausted",
+		"clearRetryState",
+		"clearRetryStateSnapshot",
+		"release",
+	] as const;
+	const target = queue as unknown as Record<string, (...args: unknown[]) => unknown>;
+	for (const method of methods) {
+		target[method] = async () => {
+			calls.push(method);
+			throw new Error(`isolated retry called shared queue method: ${method}`);
+		};
+	}
+	return calls;
+}
+
+test("retries default to a local budget without touching shared recovery state", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const limited = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const attempts = [
+		new FakeInputStream([{ type: "start", partial: assistant() }, { type: "error", reason: "error", error: limited }]),
+		new FakeInputStream([
+			{ type: "start", partial: succeeded },
+			{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+			{ type: "done", reason: "stop", message: succeeded },
+		]),
+	];
+	const progress: Array<AdaptiveRetryProgress | undefined> = [];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => attempts.shift()!,
+		onProgress: value => progress.push(value),
+	});
+
+	await output.completion.promise;
+	await waitUntil(async () => progress.at(-1) === undefined);
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(attempts.length, 0);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+	assert.equal(
+		progress.some(value =>
+			value?.attempt === 1 &&
+			value.kind === "rate-limit" &&
+			value.queuePosition === undefined &&
+			value.queueDepth === undefined
+		),
+		true,
+	);
+	assert.equal(progress.at(-1), undefined);
+});
+
+test("simultaneous isolated streams keep separate counters and create no coordination files", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const limited = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const firstAttemptsReady = Promise.withResolvers<void>();
+	let firstAttemptsStarted = 0;
+	const loggedAttempts: number[] = [];
+	const makeFactory = () => {
+		let calls = 0;
+		return {
+			get calls() {
+				return calls;
+			},
+			create(): FakeInputStream | AsyncIterable<{ type: string; error?: Record<string, unknown> }> & { result(): Promise<Record<string, unknown>> } {
+				calls += 1;
+				if (calls > 1) {
+					return new FakeInputStream([
+						{ type: "start", partial: succeeded },
+						{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+						{ type: "done", reason: "stop", message: succeeded },
+					]);
+				}
+				return {
+					async *[Symbol.asyncIterator]() {
+						firstAttemptsStarted += 1;
+						if (firstAttemptsStarted === 2) firstAttemptsReady.resolve();
+						await firstAttemptsReady.promise;
+						yield { type: "start" };
+						yield { type: "error", error: limited };
+					},
+					async result() {
+						return limited;
+					},
+				};
+			},
+		};
+	};
+	const firstFactory = makeFactory();
+	const secondFactory = makeFactory();
+	const createOutput = (factory: ReturnType<typeof makeFactory>) =>
+		createAdaptiveStream({
+			model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+			requestOptions: { apiKey: "test" },
+			queue,
+			maxRetries: 1,
+			sharedRetryRecovery: false,
+			createOutputStream: () => new FakeOutputStream(),
+			createInputStream: () => factory.create(),
+			logger: {
+				warn(message, fields) {
+					if (message === "adaptive provider isolated retry caught retryable error") {
+						loggedAttempts.push(Number(fields?.attempt));
+					}
+				},
+			},
+		});
+
+	const firstOutput = createOutput(firstFactory);
+	const secondOutput = createOutput(secondFactory);
+	await Promise.all([firstOutput.completion.promise, secondOutput.completion.promise]);
+
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(firstFactory.calls, 2);
+	assert.equal(secondFactory.calls, 2);
+	assert.deepEqual(loggedAttempts, [1, 1]);
+	assert.deepEqual(await fs.readdir(rootDir), []);
+});
+
+test("isolated retries forward the final error after the local budget", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const failed = assistant({ errorMessage: "Error Code stream_read_error: stream_read_error" });
+	let attempts = 0;
+	const progress: Array<AdaptiveRetryProgress | undefined> = [];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		retryTransientUpstream5xx: false,
+		sharedRetryRecovery: false,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "start", partial: assistant() }, { type: "error", reason: "error", error: failed }]);
+		},
+		onProgress: value => progress.push(value),
+	});
+
+	await output.completion.promise;
+	await waitUntil(async () => progress.at(-1) === undefined);
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error, failed);
+	assert.deepEqual(
+		progress.filter((value): value is AdaptiveRetryProgress => value !== undefined).map(value => value.attempt),
+		[1, 1, 2, 2, 2],
+	);
+	assert.equal(
+		progress.filter(value => value !== undefined).every(value =>
+			value.queuePosition === undefined && value.queueDepth === undefined
+		),
+		true,
+	);
+	assert.equal(progress.at(-1), undefined);
+});
+
+test("isolated retry backoff honors cancellation without touching shared recovery state", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 1_000, maxDelayMs: 1_000 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const controller = new AbortController();
+	const failed = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	const progress: Array<AdaptiveRetryProgress | undefined> = [];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test", signal: controller.signal },
+		queue,
+		sharedRetryRecovery: false,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () =>
+			new FakeInputStream([{ type: "start", partial: assistant() }, { type: "error", reason: "error", error: failed }]),
+		onProgress: value => progress.push(value),
+	});
+
+	await waitUntil(async () => progress.some(value => value?.phase === "backoff" && value.attempt === 1));
+	controller.abort();
+	await assert.rejects(output.completion.promise, error => error instanceof Error && error.name === "AbortError");
+	await waitUntil(async () => progress.at(-1) === undefined);
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(
+		progress.filter(value => value !== undefined).every(value =>
+			value.queuePosition === undefined && value.queueDepth === undefined
+		),
+		true,
+	);
+});
+
 test("stream wrapper discards pre-content 429 attempts and emits only the successful lifecycle", async () => {
 	const rootDir = await tempRoot();
 	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
@@ -664,6 +873,7 @@ test("successful substantive output clears a retry campaign inherited from anoth
 		model,
 		requestOptions,
 		queue: probeQueue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () =>
 			new FakeInputStream([
@@ -706,6 +916,7 @@ test("a generic 503 continues an inherited retry campaign instead of exhausting 
 		model,
 		requestOptions,
 		queue: probeQueue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => attempts.shift()!,
 	});
@@ -808,6 +1019,7 @@ test("fallback mode bypasses but does not exhaust an active generic 503 campaign
 		requestOptions,
 		queue: fallbackQueue,
 		retryTransientUpstream5xx: false,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => {
 			upstreamCalls += 1;
@@ -842,6 +1054,7 @@ test("a successful fallback-mode health probe clears the generic 503 campaign it
 		requestOptions,
 		queue: fallbackQueue,
 		retryTransientUpstream5xx: false,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () =>
 			new FakeInputStream([
@@ -916,6 +1129,7 @@ test("fallback mode releases a claimed campaign when its probe receives a generi
 		requestOptions,
 		queue: fallbackQueue,
 		retryTransientUpstream5xx: false,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]),
 	});
@@ -982,6 +1196,7 @@ test("two concurrent windows share one retry attempt and discard the follower's 
 		model,
 		requestOptions,
 		queue: firstQueue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => firstFactory.create(),
 		logger,
@@ -990,6 +1205,7 @@ test("two concurrent windows share one retry attempt and discard the follower's 
 		model,
 		requestOptions,
 		queue: secondQueue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => secondFactory.create(),
 		logger,
@@ -1023,6 +1239,7 @@ test("a new request under exhausted shared state reaches fallback without contac
 		model,
 		requestOptions,
 		queue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => {
 			upstreamCalls += 1;
@@ -1047,6 +1264,7 @@ test("cancelling the probe releases its ticket but preserves takeover state", as
 		model,
 		requestOptions,
 		queue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () =>
 			new FakeInputStream([
@@ -1087,6 +1305,7 @@ test("an aborted stream event releases the probe without exhausting shared state
 		model,
 		requestOptions,
 		queue: probeQueue,
+		sharedRetryRecovery: true,
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => new FakeInputStream([{ type: "error", reason: "aborted", error: aborted }]),
 	});
