@@ -507,7 +507,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						options.logger?.warn?.("adaptive provider 5xx retry window expired", {
 							provider: options.model.provider,
 							model: options.model.id,
-							attempt: localRetryAttempt,
+							attempt: transientUpstreamRetryAttempt,
 							windowMs: upstream5xxRetryWindowMs,
 						});
 						return false;
