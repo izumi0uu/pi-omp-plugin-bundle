@@ -7,7 +7,7 @@ OMP 原生 provider extension。正常状态不设置固定并发上限；上游
 ```text
 OMP request
   -> send immediately when no backlog exists
-  -> retryable rate-limit or transport failure before text/tool/image output
+  -> managed provider failure before text/tool/image output
   -> use one request-local 50-retry budget with staged backoff
   -> forward the final provider error to OMP fallback after exhaustion
 
@@ -18,12 +18,17 @@ Optional shared mode
   -> clear shared state after recovery is observed
 ```
 
-Concurrency/rate-limit errors, temporary upstream `502/503/504` responses and
-transient transport failures such as `stream_read_error`, timeouts, reset
-sockets, incomplete streams or failed fetches consume the same request-local
-retry counter and use the same pacing. Thinking-only output may be retried without duplicating the
+Concurrency/rate-limit errors, authentication or permission failures,
+quota/credits/billing exhaustion, explicit model/capacity/route unavailability,
+temporary upstream `502/503/504` responses and transient transport failures such
+as `stream_read_error`, timeouts, reset sockets, incomplete streams or failed
+fetches consume the same request-local retry counter and use the same pacing.
+Thinking-only output may be retried without duplicating the
 thinking block; once text, a tool call or an image has been emitted, the stream
 is never replayed.
+
+Unless a wall-clock mode says otherwise, a 50-retry budget means one initial
+request plus at most 50 retries: 51 provider requests in the worst case.
 
 Cross-window sharing can be changed for the current session:
 
@@ -48,13 +53,20 @@ Generic HTTP `502/503/504` handling can be changed for the current session:
 
 ```text
 /adaptive-5xx status
+/adaptive-5xx list
 /adaptive-5xx retry
+/adaptive-5xx retry-stop
 /adaptive-5xx retry-5m
 /adaptive-5xx fallback
 /adaptive-5xx toggle
 ```
 
-New sessions default to `retry`. `retry-5m` keeps retrying the current provider
+New sessions default to `retry`. `retry-stop` uses the same staged 50-retry
+budget for every provider failure managed by this extension, but ends the
+current turn instead of entering OMP fallback when that budget is exhausted.
+It is request-local and forces shared retry off so another window cannot shorten
+or prolong its budget. This includes authentication, quota, billing and explicit
+model-unavailable failures. `retry-5m` keeps retrying the current provider
 with the staged backoff for at most five wall-clock minutes after the first
 generic `502/503/504`; recovery stays on the same provider, while expiry forwards
 the last error to OMP fallback. A retry still in flight at the deadline is aborted;
@@ -63,27 +75,38 @@ long response can finish. Pressing Esc during that window cancels the turn witho
 starting fallback, including a deadline race. The fixed window is request-local, so selecting it
 turns shared retry off for the session and `/adaptive-share on` is rejected until
 another 5xx mode is selected. `fallback` forwards a generic `502/503/504` after
-the first failed request so OMP can traverse its model fallback chain.
+the first failed request so OMP can traverse its model fallback chain. `list`
+shows all modes and marks the active one. `toggle` cycles in this order:
+`retry -> retry-stop -> retry-5m -> fallback -> retry`.
 The choice is stored in the session, restored by `/resume`, and inherited by a
 fork whose active branch contains the policy entry. The status bar displays
-both choices, for example `5xx: retry 50x | shared: off`, so the effective
+both choices, for example `5xx: retry 50x -> fallback | shared: off`, so the effective
 behavior remains visible after the command notification closes. Subagents created by the session
 use that root session's current choice, including detached and nested subagents
 that outlive a later root-session switch. Policy lookup is keyed by request
 session and stable artifact lineage, so a subagent reloading the provider cannot
 replace or migrate the root policy.
 
-The 5xx switch is intentionally narrow. Explicit concurrency/rate-limit or
-`server_is_overloaded` failures, even when accompanied by `502/503/504`, status-less transport failures and
-`stream_read_error` still use the selected local or shared 50-attempt campaign in all modes.
-Their 50-attempt counter is separate from the five-minute generic-5xx window, so
+The command name is retained for session-history compatibility, but its final
+action now applies to every managed provider failure. `fallback` and `retry-5m`
+only specialize ordinary `502/503/504`; authentication, quota/billing,
+model-unavailable, overload, rate-limit and transport failures keep the
+50-retry campaign. `retry-stop` changes what happens after that campaign is
+exhausted.
+
+The ordinary-5xx part of the switch is intentionally narrow. Explicit
+concurrency/rate-limit, authentication/permission, quota/billing,
+model/capacity/route unavailable or `server_is_overloaded` failures, even when
+accompanied by `502/503/504`, plus status-less transport failures and
+`stream_read_error`, still use the 50-retry campaign in every mode. It is local
+in `retry-stop`, local or shared according to `/adaptive-share` in other modes.
+Their 50-retry counter is separate from the five-minute generic-5xx window, so
 switching error classes does not make either policy expire early.
-Authentication, quota, billing and explicit model-unavailable failures still
-pass through immediately in all modes.
 
 The policy is evaluated independently for each provider attempt in OMP's fallback
 chain. If a fallback provider also returns an ordinary `502/503/504`, it starts its
-own five-minute window; providers that fail for an immediate-fallback reason do not.
+own five-minute window. Other managed failures use that provider request's
+50-retry campaign instead of the five-minute window.
 
 Retry pacing is deliberately staged so a temporary provider limit does not
 turn into a rapid retry storm:
@@ -95,7 +118,8 @@ turn into a rapid retry storm:
 | 21-30 | 2 minutes |
 | 31-40 | 3 minutes |
 | 41-50 | 5 minutes maximum |
-| After 50 | Forward the last retryable error to OMP fallback |
+| After 50 in `retry` | Forward the last retryable error to OMP fallback |
+| After 50 in `retry-stop` | End the current turn without OMP fallback |
 
 A small positive jitter remains on staged delays to avoid synchronized retries,
 but no wait can exceed five minutes. In default isolated mode, cancellation only
@@ -129,8 +153,8 @@ without an explicit session ID are treated as background work and cannot write
 to the interactive slot.
 
 Set OMP's global `retry.maxRetries` to `0`, as shown in
-[`examples/config.yml`](examples/config.yml). The extension owns transient
-retryable failures; disabling the outer retry loop prevents a fallback model's
+[`examples/config.yml`](examples/config.yml). The extension owns managed
+provider-failure retries; disabling the outer retry loop prevents a fallback model's
 502/503 response from starting a second retry budget. `retry.modelFallback`
 remains enabled, so non-retryable failures can still traverse the configured
 fallback chain once.
@@ -141,19 +165,21 @@ cooldown behavior and diagnostic commands are recorded in
 
 | Failure | Action |
 |---|---|
-| Concurrency/rate-limit 429 before text/tool/image | Retry with the selected local/shared 50-attempt budget |
-| Generic upstream `502/503/504` in the default session mode | Retry with the selected local/shared 50-attempt budget |
+| Concurrency/rate-limit 429 before text/tool/image | Retry with the selected local/shared 50-retry budget |
+| Generic upstream `502/503/504` in the default session mode | Retry with the selected local/shared 50-retry budget |
+| Any managed provider failure after `/adaptive-5xx retry-stop` | Retry locally up to 50 times, then stop this turn without OMP fallback |
 | Generic upstream `502/503/504` after `/adaptive-5xx retry-5m` | Retry the current provider for at most five minutes, then forward the last error to OMP fallback |
 | Generic upstream `502/503/504` after `/adaptive-5xx fallback` | Forward to OMP fallback after one request |
-| Explicit server overload | Retry with the selected local/shared 50-attempt budget in every 5xx mode |
-| Stream/connection transport error before text/tool/image | Retry with the selected local/shared 50-attempt budget |
-| 429 quota, credits or billing exhausted | Forward to OMP fallback |
-| 401/403 authentication failure | Forward to OMP fallback |
-| Model unavailable, no capacity or other generic 5xx | Forward to OMP fallback |
+| Explicit server overload | Retry with the 50-retry budget; `retry-stop` ends instead of fallback on exhaustion |
+| Stream/connection transport error before text/tool/image | Retry with the 50-retry budget; `retry-stop` ends instead of fallback on exhaustion |
+| 429 quota, credits or billing exhausted | Retry with the 50-retry budget |
+| 401/402/403 authentication, payment or permission failure | Retry with the 50-retry budget |
+| Explicit model, capacity or route unavailable | Retry with the 50-retry budget |
 | Error after text, tool call or image output | Forward unchanged; never replay partial output |
 | 50th isolated retry still fails | Forward the final provider error to OMP fallback |
 | 50th shared retry still fails | Forward to OMP fallback and cache lane exhaustion for five minutes |
 | Shared request while lane exhaustion is cached | Forward to OMP fallback without contacting upstream |
+| 50th retry in `retry-stop` still fails | Emit a terminal aborted turn; do not enter OMP fallback |
 
 ## Registered providers
 

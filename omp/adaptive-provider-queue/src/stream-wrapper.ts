@@ -9,14 +9,22 @@ import {
 	type RetryFailureKind,
 	type RetryWindowDecision,
 } from "./queue.ts";
-import type { AdaptiveRetryProgress } from "./retry-progress.ts";
+import type { AdaptiveRetryProgress, RetryProgressKind } from "./retry-progress.ts";
 import {
 	TRANSIENT_UPSTREAM_RETRY_WINDOW_MS,
 	type TransientUpstreamMode,
 } from "./session-policy.ts";
 
 interface AssistantLike {
+	role?: string;
+	api?: string;
+	provider?: string;
+	model?: string;
+	content?: unknown[];
+	usage?: unknown;
+	timestamp?: number;
 	stopReason?: string;
+	errorId?: unknown;
 	errorMessage?: string;
 	errorStatus?: number;
 	[key: string]: unknown;
@@ -98,10 +106,18 @@ export class AdaptiveRetryExhaustedError extends Error {
 	}
 }
 
+export function adaptiveRetryStopMessage(maxRetries: number): string {
+	return `Adaptive provider stopped after ${maxRetries} retries; fallback suppressed for this turn.`;
+}
+
 const QUOTA_OR_BILLING_PATTERN =
-	/insufficient[_ -]?quota|quota (?:exceeded|exhausted)|resource[_ -]?exhausted|usage[_ -]?limit[_ -]?reached|billing|credit|balance|spend(?:ing)?[_ -]?limit|monthly[_ -]?limit|daily[_ -]?limit/i;
+	/\b(?:insufficient[_ -]+(?:quota|credits?|balance|funds)|(?:quota|credits?|balance)[_ -]+(?:(?:has|have|is|was|been)[_ -]+)*(?:exceeded|exhausted|depleted|insufficient)|credits?[_ -]+balance[_ -]+(?:is[_ -]+)?(?:too[_ -]+low|insufficient|exhausted|depleted)|exceeded[_ -]+(?:(?:your|the)[_ -]+)?(?:current[_ -]+)?quota|resource[_ -]+exhausted|(?:usage|spend(?:ing)?|monthly|daily)[_ -]+limit[_ -]+(?:(?:has|is|was|been)[_ -]+)*(?:reached|exceeded|exhausted)|billing[_ -]+(?:hard[_ -]+)?limit[_ -]+(?:(?:has|is|was|been)[_ -]+)*(?:reached|exceeded|exhausted)|billing[_ -]+(?:(?:account|quota)[_ -]+)?(?:error|failed|failure|disabled|inactive|suspended|exceeded|exhausted|not[_ -]+active)|payment[_ -]+(?:required|failed|failure|declined)|(?:out[_ -]+of|no[_ -]+)(?:credits?|funds))\b/i;
 const MODEL_UNAVAILABLE_PATTERN =
-	/model.{0,40}(?:unavailable|not available|disabled|offline|not found|overloaded)|no available (?:model|channel|route)|no capacity|capacity exhausted|upstream unavailable/i;
+	/\b(?:model[_ -]?(?:not[_ -]?found|unavailable|disabled|offline|overloaded|unsupported)|(?:requested[_ -]+)?model[_ -]+(?:is[_ -]+)?(?:unavailable|not[_ -]+available|disabled|offline|not[_ -]+found|not[_ -]+supported|unsupported|overloaded)|model[_ -]+[a-z0-9][a-z0-9._:/-]{0,63}[_ -]+is[_ -]+(?:unavailable|not[_ -]+available|disabled|offline|not[_ -]+found|not[_ -]+supported|unsupported|overloaded)|(?:requested[_ -]+)?model\b.{0,80}\b(?:does[_ -]+not[_ -]+exist|you[_ -]+do[_ -]+not[_ -]+have[_ -]+access|access[_ -]+denied)|(?:unavailable|disabled|offline)[_ -]+model|unsupported[_-]+model|unsupported[_ -]+model(?=$|[.:,;])|no[_ -]+available[_ -]+(?:model|channel|route)|no[_ -]+(?:model|channel|route)[_ -]+available|no[_ -]+capacity|(?:capacity|channel|route)[_ -]+(?:is[_ -]+)?(?:unavailable|not[_ -]+available|disabled|offline|not[_ -]+found|exhausted)|capacity[_ -]+exhausted)\b/i;
+const AUTHENTICATION_OR_PERMISSION_PATTERN =
+	/\b(?:authentication[_ -]+(?:error|failed|failure|required)|unauthorized|forbidden|not[_ -]+authorized|(?:access|permission)[_ -]+denied|(?:api[_ -]?key|credentials?|(?:access|oauth|auth|bearer|refresh)[_ -]+token)[_ -]+(?:(?:has|have|is|was|been)[_ -]+)*(?:expired|invalid|revoked|disabled)|(?:expired|invalid|revoked|disabled)[_ -]+(?:api[_ -]?key|credentials?|(?:access|oauth|auth|bearer|refresh)[_ -]+token))\b/i;
+const AUTHENTICATION_HTTP_STATUS_PATTERN =
+	/(?:^|\b(?:http(?:[_ -]*error|[_ -]+status)?|status(?:[_ -]+code)?|error(?:[_ -]+code)?)[_ :=(-]+)(?:401|402|403)\b/i;
 const TRANSIENT_SERVER_OVERLOAD_PATTERN =
 	/server[_ -]?is[_ -]?overloaded|servers? (?:are )?(?:currently )?overloaded|server overload(?:ed)?/i;
 const TRANSIENT_RATE_LIMIT_PATTERN =
@@ -119,7 +135,23 @@ function errorText(error: unknown): string {
 	if (error instanceof Error) return error.message;
 	if (!error || typeof error !== "object") return String(error ?? "");
 	const candidate = error as Record<string, unknown>;
-	const direct = [candidate.errorMessage, candidate.message, candidate.error, candidate.detail]
+	const nestedError =
+		candidate.error && typeof candidate.error === "object"
+			? (candidate.error as Record<string, unknown>)
+			: undefined;
+	const direct = [
+		candidate.errorMessage,
+		candidate.message,
+		candidate.error,
+		candidate.detail,
+		candidate.code,
+		candidate.errorCode,
+		candidate.errorType,
+		nestedError?.message,
+		nestedError?.detail,
+		nestedError?.code,
+		nestedError?.type,
+	]
 		.filter(value => typeof value === "string")
 		.join(" ");
 	if (direct) return direct;
@@ -141,7 +173,7 @@ function errorStatus(error: unknown): number | undefined {
 
 export function isAdaptiveRateLimit(error: unknown): boolean {
 	const text = errorText(error);
-	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
+	if (isAdaptiveProviderFailure(error)) return false;
 	const status = errorStatus(error);
 	if (TRANSIENT_SERVER_OVERLOAD_PATTERN.test(text)) {
 		return status === undefined || status === 429 || TRANSIENT_UPSTREAM_STATUSES.has(status);
@@ -155,7 +187,7 @@ export function isAdaptiveRateLimit(error: unknown): boolean {
 
 export function isAdaptiveTransientTransport(error: unknown): boolean {
 	const text = errorText(error);
-	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
+	if (isAdaptiveProviderFailure(error)) return false;
 	const status = errorStatus(error);
 	if (isAdaptiveRateLimit(error)) return false;
 	if (status === undefined) return TRANSIENT_TRANSPORT_PATTERN.test(text);
@@ -163,12 +195,25 @@ export function isAdaptiveTransientTransport(error: unknown): boolean {
 }
 
 export function isAdaptiveTransientUpstream(error: unknown): boolean {
-	const text = errorText(error);
-	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
+	if (isAdaptiveProviderFailure(error)) return false;
 	return (
 		TRANSIENT_UPSTREAM_STATUSES.has(errorStatus(error) ?? 0) &&
 		!isAdaptiveRateLimit(error) &&
 		!isAdaptiveTransientTransport(error)
+	);
+}
+
+export function isAdaptiveProviderFailure(error: unknown): boolean {
+	const text = errorText(error);
+	const status = errorStatus(error);
+	return (
+		status === 401 ||
+		status === 402 ||
+		status === 403 ||
+		AUTHENTICATION_HTTP_STATUS_PATTERN.test(text) ||
+		AUTHENTICATION_OR_PERMISSION_PATTERN.test(text) ||
+		QUOTA_OR_BILLING_PATTERN.test(text) ||
+		MODEL_UNAVAILABLE_PATTERN.test(text)
 	);
 }
 
@@ -229,6 +274,49 @@ function isCancellation(error: unknown, signal?: AbortSignal): boolean {
 
 function cancellationError(): Error {
 	return new DOMException("Adaptive provider request aborted", "AbortError");
+}
+
+function emptyUsage() {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function stoppedAfterRetryBudget(
+	message: AssistantLike | undefined,
+	model: AdaptiveStreamOptions["model"],
+	maxRetries: number,
+): AssistantLike {
+	const { errorId: _errorId, errorStatus: _errorStatus, ...envelope } = message ?? {};
+	return {
+		...envelope,
+		role: "assistant",
+		api: typeof envelope.api === "string" ? envelope.api : String(model.api ?? "openai-responses"),
+		provider: typeof envelope.provider === "string" ? envelope.provider : model.provider,
+		model: typeof envelope.model === "string" ? envelope.model : String(model.id ?? "unknown"),
+		content: [],
+		usage: envelope.usage ?? emptyUsage(),
+		stopReason: "aborted",
+		errorMessage: adaptiveRetryStopMessage(maxRetries),
+		timestamp: Date.now(),
+	};
+}
+
+function stoppedAfterRetryBudgetEvent(
+	message: AssistantLike | undefined,
+	model: AdaptiveStreamOptions["model"],
+	maxRetries: number,
+): StreamEventLike {
+	return {
+		type: "error",
+		reason: "aborted",
+		error: stoppedAfterRetryBudget(message, model, maxRetries),
+	};
 }
 
 function defaultScheduleTimeout(callback: () => void, delayMs: number): ScheduledTimeoutCleanup {
@@ -318,7 +406,11 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		0,
 		Math.floor(options.upstream5xxRetryWindowMs ?? TRANSIENT_UPSTREAM_RETRY_WINDOW_MS),
 	);
-	const sharedRetryRecovery = transientUpstream5xxMode === "retry-5m" ? false : (options.sharedRetryRecovery ?? false);
+	const sharedRetryRecovery =
+		transientUpstream5xxMode === "retry-5m" || transientUpstream5xxMode === "retry-stop"
+			? false
+			: (options.sharedRetryRecovery ?? false);
+	const stopAfterRetryExhaustion = transientUpstream5xxMode === "retry-stop";
 	const laneId = createLaneId({
 		provider: options.model.provider,
 		baseUrl: options.model.baseUrl,
@@ -337,9 +429,10 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		let transientUpstreamRetryDeadlineAt: number | undefined;
 		let nextAttemptUsesTransientUpstreamDeadline = false;
 		let lastTransientUpstreamFailure: TransientUpstreamFailure | undefined;
+		let lastRetryableFailure: AssistantLike | undefined;
 		let progressAttempt = 0;
 		let progressMaxRetries = maxRetries;
-		let progressKind: RetryFailureKind | undefined;
+		let progressKind: RetryProgressKind | undefined;
 		let progressPosition: QueuePosition | undefined;
 		let progressUsesTransientUpstreamWindow = false;
 		const progressEnabled = options.onProgress !== undefined;
@@ -454,6 +547,11 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							attempt: window.state.attempt,
 							maxRetries: window.state.maxRetries,
 						});
+						if (stopAfterRetryExhaustion) {
+							ticket = await releaseTicket(options.queue, ticket);
+							output.push(stoppedAfterRetryBudgetEvent(lastRetryableFailure, options.model, maxRetries));
+							return;
+						}
 						throw retryExhaustedError(window);
 					}
 				}
@@ -481,8 +579,9 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					for (const event of replaySafeEvents) pushEvent(event);
 					replaySafeEvents.length = 0;
 				};
-				const retryKind = (error: unknown): "rate-limit" | "transport" | undefined => {
+				const retryKind = (error: unknown): RetryProgressKind | undefined => {
 					if (isAdaptiveRateLimit(error)) return "rate-limit";
+					if (isAdaptiveProviderFailure(error)) return "provider";
 					if (isAdaptiveTransientUpstream(error)) {
 						return retryTransientUpstream5xx ? "transport" : undefined;
 					}
@@ -492,7 +591,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					!retryTransientUpstream5xx && isAdaptiveTransientUpstream(error);
 				const waitForLocalRetry = async (
 					error: unknown,
-					kind: "rate-limit" | "transport",
+					kind: RetryProgressKind,
 				): Promise<boolean> => {
 					const usesTransientUpstreamWindow =
 						transientUpstream5xxMode === "retry-5m" && isAdaptiveTransientUpstream(error);
@@ -586,7 +685,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				};
 				const waitForRetry = async (
 					error: unknown,
-					kind: "rate-limit" | "transport",
+					kind: RetryProgressKind,
 					attemptStartedAt: RetryAttemptSnapshot,
 				): Promise<boolean> => {
 					if (!sharedRetryRecovery) return waitForLocalRetry(error, kind);
@@ -629,7 +728,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					const decision = await options.queue.recordRetryFailure(ticket, {
 						maxRetries,
 						retryAfterMs,
-						kind,
+						kind: kind === "provider" ? "transport" : kind,
 						status: transientUpstreamStatus(error),
 					});
 					if (decision.status === "exhausted") {
@@ -751,6 +850,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							!substantiveContentExists(event.error) &&
 							kind !== undefined
 						) {
+							lastRetryableFailure = event.error;
 							if (
 								transientUpstream5xxMode === "retry-5m" &&
 								isAdaptiveTransientUpstream(event.error)
@@ -766,6 +866,12 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 								break;
 							}
 							if (signal?.aborted) throw cancellationError();
+							if (stopAfterRetryExhaustion) {
+								replaySafeEvents.length = 0;
+								ticket = await releaseTicket(options.queue, ticket);
+								pushEvent(stoppedAfterRetryBudgetEvent(event.error, options.model, maxRetries));
+								return;
+							}
 							flushReplaySafeEvents();
 							ticket = await releaseTicket(options.queue, ticket);
 							if (signal?.aborted) throw cancellationError();
@@ -817,7 +923,13 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					}
 					const cancelled = isCancellation(error, signal);
 					const kind = retryKind(error);
-					if (!cancelled && !hasSubstantiveOutput && kind !== undefined) {
+					if (
+						!cancelled &&
+						!hasSubstantiveOutput &&
+						!substantiveContentExists(error && typeof error === "object" ? (error as AssistantLike) : undefined) &&
+						kind !== undefined
+					) {
+						lastRetryableFailure = error && typeof error === "object" ? (error as AssistantLike) : undefined;
 						if (
 							transientUpstream5xxMode === "retry-5m" &&
 							isAdaptiveTransientUpstream(error)
@@ -825,6 +937,13 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							lastTransientUpstreamFailure = { type: "throw", error, prefix: [...replaySafeEvents] };
 						}
 						if (await waitForRetry(error, kind, attemptStartedAt)) continue;
+						if (signal?.aborted) throw cancellationError();
+						if (stopAfterRetryExhaustion) {
+							replaySafeEvents.length = 0;
+							ticket = await releaseTicket(options.queue, ticket);
+							pushEvent(stoppedAfterRetryBudgetEvent(lastRetryableFailure, options.model, maxRetries));
+							return;
+						}
 					}
 					if (signal?.aborted) throw cancellationError();
 					flushReplaySafeEvents();

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0 - 2026-08-12
+
+- Add `/adaptive-5xx retry-stop`. Managed pre-content transient failures use an
+  isolated 50-retry budget; exhaustion emits an explicit aborted turn so OMP
+  does not traverse the fallback chain.
+- Route pre-content `401/402/403`, revoked or invalid credentials,
+  quota/credits/billing exhaustion and explicit model/capacity/route
+  unavailability through the same 50-retry campaign. In `retry`, exhaustion
+  reaches OMP fallback; in `retry-stop`, exhaustion ends the turn.
+- Add `/adaptive-5xx list`, including a marker for the active mode and concise
+  behavior descriptions.
+- Make `/adaptive-5xx toggle` cycle in the documented order: `retry`,
+  `retry-stop`, `retry-5m`, `fallback`, then back to `retry`.
+
 ## 0.6.0 - 2026-08-12
 
 - Add `/adaptive-5xx retry-5m`, which retries ordinary pre-content

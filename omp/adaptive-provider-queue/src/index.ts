@@ -21,6 +21,8 @@ import {
 	ADAPTIVE_5XX_POLICY_ENTRY,
 	ADAPTIVE_SHARE_POLICY_ENTRY,
 	formatAdaptivePolicyStatus,
+	formatTransientUpstreamModeList,
+	modeForcesIsolatedRetry,
 	parseSharedRetryRecoveryCommand,
 	parseTransientUpstreamModeCommand,
 	restoreSessionPolicy,
@@ -71,7 +73,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 		);
 	};
 	const effectiveSharedRetryRecovery = (mode: TransientUpstreamMode, sessionId: string | undefined) =>
-		mode === "retry-5m" ? false : sessionSharedRetryRecovery(sessionPolicies, sessionId);
+		modeForcesIsolatedRetry(mode) ? false : sessionSharedRetryRecovery(sessionPolicies, sessionId);
 	const rehydrateSessionPolicy = (ctx: SessionContextLike) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (ctx.hasUI) retryStatuses.bindSession(sessionId, ctx.ui);
@@ -97,23 +99,28 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("adaptive-5xx", {
-		description: "Choose whether generic 502/503/504 errors retry 50x, retry for 5m, or immediately fall back",
+		description: "List or select the retry, retry-stop, retry-5m, and fallback modes",
 		handler: (args, ctx) => {
 			const sessionId = ctx.sessionManager.getSessionId();
 			const currentMode = sessionPolicyMode(sessionPolicies, sessionId);
 			const command = parseTransientUpstreamModeCommand(args, currentMode);
 			if (!command) {
-				ctx.ui.notify("Usage: /adaptive-5xx [status|retry|retry-5m|fallback|toggle]", "warning");
+				ctx.ui.notify("Usage: /adaptive-5xx [status|list|retry|retry-stop|retry-5m|fallback|toggle]", "warning");
+				return;
+			}
+			if (command === "list") {
+				updateStatus(ctx, currentMode, effectiveSharedRetryRecovery(currentMode, sessionId));
+				ctx.ui.notify(formatTransientUpstreamModeList(currentMode), "info");
 				return;
 			}
 			if (command !== "status") {
 				setSessionPolicy(sessionPolicies, sessionId, command);
 				pi.appendEntry(ADAPTIVE_5XX_POLICY_ENTRY, { mode: command });
-				if (command === "retry-5m" && sessionSharedRetryRecovery(sessionPolicies, sessionId)) {
+				if (modeForcesIsolatedRetry(command) && sessionSharedRetryRecovery(sessionPolicies, sessionId)) {
 					setSessionSharedRetryRecovery(sessionPolicies, sessionId, false);
 					pi.appendEntry(ADAPTIVE_SHARE_POLICY_ENTRY, { enabled: false });
 					ctx.ui.notify(
-						"The 5-minute wall-clock window is request-local; shared retry was turned off for this session.",
+						`${command} is request-local; shared retry was turned off for this session.`,
 						"warning",
 					);
 				}
@@ -123,7 +130,9 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			updateStatus(ctx, mode, sharedRetryRecovery);
 			ctx.ui.notify(
 				mode === "retry"
-					? `Generic 502/503/504 errors will use a ${sharedRetryRecovery ? "shared" : "local"} 50-attempt retry budget in this session.`
+					? `Managed provider errors will use a ${sharedRetryRecovery ? "shared" : "local"} 50-retry budget, then enter OMP fallback.`
+					: mode === "retry-stop"
+						? "Managed provider errors will retry up to 50 times, then stop this turn without OMP fallback."
 					: mode === "retry-5m"
 						? "Generic 502/503/504 errors will retry on the current provider for up to 5 minutes, then enter OMP fallback. Press Esc to cancel."
 						: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
@@ -142,9 +151,9 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				ctx.ui.notify("Usage: /adaptive-share [status|on|off|toggle]", "warning");
 				return;
 			}
-			if (mode === "retry-5m" && command === true) {
+			if (modeForcesIsolatedRetry(mode) && command === true) {
 				ctx.ui.notify(
-					"Shared retry cannot be enabled with retry-5m; choose /adaptive-5xx retry or fallback first.",
+					`Shared retry cannot be enabled with ${mode}; choose /adaptive-5xx retry or fallback first.`,
 					"warning",
 				);
 				return;

@@ -4,7 +4,10 @@ export const DEFAULT_TRANSIENT_UPSTREAM_MODE = "retry" as const;
 export const DEFAULT_SHARED_RETRY_RECOVERY = false;
 export const TRANSIENT_UPSTREAM_RETRY_WINDOW_MS = 300_000;
 
-export type TransientUpstreamMode = "retry" | "retry-5m" | "fallback";
+export const TRANSIENT_UPSTREAM_MODE_ORDER = ["retry", "retry-stop", "retry-5m", "fallback"] as const;
+
+export type TransientUpstreamMode = (typeof TRANSIENT_UPSTREAM_MODE_ORDER)[number];
+export type TransientUpstreamModeCommand = TransientUpstreamMode | "status" | "list";
 
 export interface SessionPolicyStore {
 	readonly version: 3;
@@ -26,7 +29,9 @@ interface SessionEntryLike {
 function modeFromData(data: unknown): TransientUpstreamMode | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const mode = (data as Record<string, unknown>).mode;
-	return mode === "retry" || mode === "retry-5m" || mode === "fallback" ? mode : undefined;
+	return typeof mode === "string" && TRANSIENT_UPSTREAM_MODE_ORDER.includes(mode as TransientUpstreamMode)
+		? (mode as TransientUpstreamMode)
+		: undefined;
 }
 
 function sharedRetryRecoveryFromData(data: unknown): boolean | undefined {
@@ -176,13 +181,38 @@ export function sessionSharedRetryRecovery(
 export function parseTransientUpstreamModeCommand(
 	args: string,
 	current: TransientUpstreamMode,
-): TransientUpstreamMode | "status" | undefined {
+): TransientUpstreamModeCommand | undefined {
 	const action = args.trim().toLowerCase();
 	if (!action || action === "status") return "status";
+	if (action === "list" || action === "ls") return "list";
 	if (action === "retry" || action === "fallback") return action;
+	if (action === "retry-stop" || action === "retrystop" || action === "retry50-stop" || action === "stop") {
+		return "retry-stop";
+	}
 	if (action === "retry-5m" || action === "retry5m" || action === "5m") return "retry-5m";
-	if (action === "toggle") return current === "retry" ? "fallback" : "retry";
+	if (action === "toggle") {
+		const currentIndex = TRANSIENT_UPSTREAM_MODE_ORDER.indexOf(current);
+		return TRANSIENT_UPSTREAM_MODE_ORDER[(currentIndex + 1) % TRANSIENT_UPSTREAM_MODE_ORDER.length];
+	}
 	return undefined;
+}
+
+export function modeForcesIsolatedRetry(mode: TransientUpstreamMode): boolean {
+	return mode === "retry-stop" || mode === "retry-5m";
+}
+
+export function formatTransientUpstreamModeList(current: TransientUpstreamMode): string {
+	const modes: ReadonlyArray<readonly [TransientUpstreamMode, string]> = [
+		["retry", "managed errors retry 50x, then OMP fallback"],
+		["retry-stop", "managed errors retry 50x, then stop without fallback"],
+		["retry-5m", "ordinary 502/503/504 retry for 5m, then OMP fallback"],
+		["fallback", "ordinary 502/503/504 immediately enter OMP fallback"],
+	];
+	return [
+		"Adaptive retry modes:",
+		...modes.map(([mode, description]) => `${mode === current ? ">" : " "} ${mode}: ${description}`),
+		`toggle: ${TRANSIENT_UPSTREAM_MODE_ORDER.join(" -> ")} -> retry`,
+	].join("\n");
 }
 
 export function parseSharedRetryRecoveryCommand(
@@ -206,6 +236,8 @@ export function formatAdaptivePolicyStatus(
 			? "5xx: immediate fallback"
 			: mode === "retry-5m"
 				? "5xx: retry 5m -> fallback"
-				: "5xx: retry 50x";
+				: mode === "retry-stop"
+					? "5xx: retry 50x -> stop"
+					: "5xx: retry 50x -> fallback";
 	return `${upstream} | shared: ${sharedRetryRecovery ? "on" : "off"}`;
 }

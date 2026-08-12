@@ -7,6 +7,8 @@ import {
 	DEFAULT_TRANSIENT_UPSTREAM_MODE,
 	createSessionPolicyStore,
 	formatAdaptivePolicyStatus,
+	formatTransientUpstreamModeList,
+	modeForcesIsolatedRetry,
 	parseSharedRetryRecoveryCommand,
 	parseTransientUpstreamModeCommand,
 	restoreSessionPolicy,
@@ -74,15 +76,38 @@ test("the latest valid shared recovery entry is restored independently", () => {
 test("the session command parses status, explicit modes and toggle", () => {
 	assert.equal(parseTransientUpstreamModeCommand("", "retry"), "status");
 	assert.equal(parseTransientUpstreamModeCommand(" STATUS ", "fallback"), "status");
+	assert.equal(parseTransientUpstreamModeCommand("list", "retry-stop"), "list");
+	assert.equal(parseTransientUpstreamModeCommand("LS", "retry"), "list");
 	assert.equal(parseTransientUpstreamModeCommand("retry", "fallback"), "retry");
+	assert.equal(parseTransientUpstreamModeCommand("retry-stop", "retry"), "retry-stop");
+	assert.equal(parseTransientUpstreamModeCommand("STOP", "retry"), "retry-stop");
 	assert.equal(parseTransientUpstreamModeCommand("retry-5m", "retry"), "retry-5m");
 	assert.equal(parseTransientUpstreamModeCommand("RETRY5M", "fallback"), "retry-5m");
 	assert.equal(parseTransientUpstreamModeCommand("5m", "retry"), "retry-5m");
 	assert.equal(parseTransientUpstreamModeCommand("FALLBACK", "retry"), "fallback");
-	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry"), "fallback");
+	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry"), "retry-stop");
+	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry-stop"), "retry-5m");
+	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry-5m"), "fallback");
 	assert.equal(parseTransientUpstreamModeCommand("toggle", "fallback"), "retry");
-	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry-5m"), "retry");
 	assert.equal(parseTransientUpstreamModeCommand("unknown", "retry"), undefined);
+});
+
+test("the mode list documents the same order used by toggle", () => {
+	assert.equal(
+		formatTransientUpstreamModeList("retry-stop"),
+		[
+			"Adaptive retry modes:",
+			"  retry: managed errors retry 50x, then OMP fallback",
+			"> retry-stop: managed errors retry 50x, then stop without fallback",
+			"  retry-5m: ordinary 502/503/504 retry for 5m, then OMP fallback",
+			"  fallback: ordinary 502/503/504 immediately enter OMP fallback",
+			"toggle: retry -> retry-stop -> retry-5m -> fallback -> retry",
+		].join("\n"),
+	);
+	assert.equal(modeForcesIsolatedRetry("retry"), false);
+	assert.equal(modeForcesIsolatedRetry("fallback"), false);
+	assert.equal(modeForcesIsolatedRetry("retry-stop"), true);
+	assert.equal(modeForcesIsolatedRetry("retry-5m"), true);
 });
 
 test("the shared recovery command parses status, explicit modes and toggle", () => {
@@ -96,7 +121,8 @@ test("the shared recovery command parses status, explicit modes and toggle", () 
 });
 
 test("the combined status reports both independent policies", () => {
-	assert.equal(formatAdaptivePolicyStatus("retry", false), "5xx: retry 50x | shared: off");
+	assert.equal(formatAdaptivePolicyStatus("retry", false), "5xx: retry 50x -> fallback | shared: off");
+	assert.equal(formatAdaptivePolicyStatus("retry-stop", false), "5xx: retry 50x -> stop | shared: off");
 	assert.equal(formatAdaptivePolicyStatus("retry-5m", false), "5xx: retry 5m -> fallback | shared: off");
 	assert.equal(formatAdaptivePolicyStatus("fallback", true), "5xx: immediate fallback | shared: on");
 });

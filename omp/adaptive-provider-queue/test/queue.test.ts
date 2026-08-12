@@ -14,7 +14,9 @@ import { toOpenAIResponsesModel } from "../src/responses-model.ts";
 import type { AdaptiveRetryProgress } from "../src/retry-progress.ts";
 import {
 	AdaptiveRetryExhaustedError,
+	adaptiveRetryStopMessage,
 	createAdaptiveStream,
+	isAdaptiveProviderFailure,
 	isAdaptiveRateLimit,
 	isAdaptiveTransientTransport,
 	isAdaptiveTransientUpstream,
@@ -49,7 +51,7 @@ test("lane identity shares an endpoint only when the credential also matches", (
 	assert.notEqual(first, otherAccount);
 });
 
-test("transient concurrency limits queue while quota and unavailable errors pass through", () => {
+test("transient concurrency limits remain distinct from provider-account failures", () => {
 	assert.equal(
 		isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "rate_limit_exceeded: Concurrency limit exceeded for account" }),
 		true,
@@ -78,6 +80,54 @@ test("retry-after hints are parsed without turning quota errors into queue waits
 	assert.equal(retryAfterMsFromError({ errorMessage: "try again in 750ms" }), 750);
 });
 
+test("authentication, quota, billing and explicit model failures enter the provider retry class", () => {
+	for (const error of [
+		{ errorStatus: 401, errorMessage: "OAuth access token has been revoked" },
+		{ errorStatus: 402, errorMessage: "billing balance exhausted" },
+		{ errorStatus: 403, errorMessage: "Forbidden" },
+		{ errorStatus: 429, errorMessage: "insufficient_quota: add credits" },
+		{ errorStatus: 503, errorMessage: "model unavailable" },
+		{ errorMessage: "no available route for this model" },
+		{ errorMessage: "Error: 401 OAuth access token has been revoked" },
+		{ errorMessage: "The quota has been exceeded." },
+		{ errorMessage: "You exceeded your current quota, please check your plan and billing details." },
+		{ errorMessage: "Insufficient funds." },
+		{ errorMessage: "Your credit balance is too low to access the API." },
+		{ errorMessage: "Billing hard limit has been reached." },
+		{ errorMessage: "API key expired" },
+		{ errorMessage: "credential revoked" },
+		{ errorMessage: "Request failed with status code 401" },
+		{ errorMessage: "HTTPError: 401 Client Error" },
+		{ errorMessage: "error_code=401" },
+		{ errorMessage: "status=403" },
+		{ errorStatus: 404, errorMessage: "The model gpt-x does not exist or you do not have access to it" },
+		{ errorStatus: 503, errorMessage: "Model gpt-x is unavailable" },
+		{ errorStatus: 400, errorMessage: "The requested model is not supported" },
+		{ errorStatus: 400, errorMessage: "invalid_request_error: model not supported with this account" },
+		{ errorStatus: 503, errorMessage: "route unavailable" },
+		{ errorStatus: 503, errorMessage: "no route available for this model" },
+		{ errorStatus: 503, errorMessage: "capacity unavailable" },
+		{ error: { type: "model_not_found", message: "Requested model was not found" } },
+	]) {
+		assert.equal(isAdaptiveProviderFailure(error), true);
+	}
+	for (const error of [
+		{ errorStatus: 400, errorMessage: "invalid request schema" },
+		{ errorStatus: 400, errorMessage: "max_tokens is invalid" },
+		{ errorStatus: 400, errorMessage: "Invalid request: unbalanced delimiter" },
+		{ errorStatus: 400, errorMessage: "Invalid prompt: billing address is malformed" },
+		{ errorStatus: 400, errorMessage: "token count is invalid for this request" },
+		{ errorStatus: 400, errorMessage: "invalid token count for this request" },
+		{ errorStatus: 400, errorMessage: "unsupported model output format" },
+		{ errorStatus: 400, errorMessage: "credit card field is invalid" },
+		{ errorStatus: 404, errorMessage: "resource not found" },
+		{ errorStatus: 503, errorMessage: "Service temporarily unavailable" },
+		{ errorStatus: 503, errorMessage: "upstream unavailable" },
+	]) {
+		assert.equal(isAdaptiveProviderFailure(error), false);
+	}
+});
+
 test("transport and generic upstream errors use distinct adaptive retry classes", () => {
 	assert.equal(isAdaptiveTransientTransport({ errorMessage: "Error Code stream_read_error: stream_read_error" }), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("socket connection was closed unexpectedly")), true);
@@ -98,6 +148,7 @@ test("transport and generic upstream errors use distinct adaptive retry classes"
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 502, errorMessage: "socket connection was closed unexpectedly" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 500, errorMessage: "Internal server error" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "model unavailable" }), false);
+	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "authentication_error: credentials revoked" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Our servers are currently overloaded" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Concurrency limit exceeded" }), false);
 });
@@ -801,6 +852,249 @@ test("isolated retries forward the final error after the local budget", async ()
 		true,
 	);
 	assert.equal(progress.at(-1), undefined);
+});
+
+test("retry-stop ends with a sanitized aborted message after the local retry budget", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const failed = assistant({
+		role: "assistant",
+		api: "openai-responses",
+		provider: "primary",
+		model: "model",
+		errorStatus: 503,
+		errorId: 12345,
+		errorMessage: "Service temporarily unavailable",
+		usage: { input: 7, output: 0 },
+	});
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", api: "openai-responses", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		transientUpstream5xxMode: "retry-stop",
+		sharedRetryRecovery: true,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "start", partial: assistant() }, { type: "error", reason: "error", error: failed }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(attempts, 3);
+	assert.deepEqual(output.events.map(event => event.type), ["error"]);
+	const stopped = output.events[0];
+	assert.equal(stopped.reason, "aborted");
+	assert.equal(stopped.error.stopReason, "aborted");
+	assert.equal(stopped.error.errorMessage, adaptiveRetryStopMessage(2));
+	assert.equal(stopped.error.provider, "primary");
+	assert.equal(stopped.error.model, "model");
+	assert.deepEqual(stopped.error.content, []);
+	assert.deepEqual(stopped.error.usage, { input: 7, output: 0 });
+	assert.equal("errorStatus" in stopped.error, false);
+	assert.equal("errorId" in stopped.error, false);
+});
+
+test("retry-stop also suppresses fallback when a retryable failure is thrown", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = { errorMessage: "socket connection was closed unexpectedly" };
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", api: "openai-responses", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		transientUpstream5xxMode: "retry-stop",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			throw failed;
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 2);
+	assert.equal(output.events[0].reason, "aborted");
+	assert.equal(output.events[0].error.errorMessage, adaptiveRetryStopMessage(1));
+	assert.equal(output.events[0].error.stopReason, "aborted");
+});
+
+test("retry-stop never replays or sanitizes a thrown failure that already contains substantive output", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const partial = assistant({
+		errorMessage: "socket connection was closed unexpectedly",
+		content: [{ type: "text", text: "already emitted" }],
+	});
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", api: "openai-responses", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		transientUpstream5xxMode: "retry-stop",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			throw partial;
+		},
+	});
+
+	await assert.rejects(output.completion.promise, error => error === partial);
+	assert.equal(attempts, 1);
+	assert.equal(output.events.length, 0);
+});
+
+test("retry-stop lets user cancellation win when a thrown failure exhausts the retry budget", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const controller = new AbortController();
+	const failed = { errorMessage: "socket connection was closed unexpectedly" };
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", api: "openai-responses", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test", signal: controller.signal },
+		queue,
+		maxRetries: 1,
+		transientUpstream5xxMode: "retry-stop",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			throw failed;
+		},
+		onProgress: progress => {
+			if (attempts === 2 && progress?.phase === "backoff") controller.abort();
+		},
+	});
+
+	await assert.rejects(output.completion.promise, error => error instanceof Error && error.name === "AbortError");
+	assert.equal(attempts, 2);
+	assert.equal(output.events.length, 0);
+});
+
+test("retry-stop retries authentication failures and stops without fallback after exhaustion", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const authFailure = assistant({ errorStatus: 401, errorMessage: "OAuth access token has been revoked" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		transientUpstream5xxMode: "retry-stop",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: authFailure }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error.stopReason, "aborted");
+	assert.equal(output.events.at(-1).error.errorMessage, adaptiveRetryStopMessage(2));
+	assert.equal(output.events.at(-1).reason, "aborted");
+});
+
+test("retry mode forwards quota failures only after the retry budget is exhausted", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const quotaFailure = assistant({ errorStatus: 429, errorMessage: "insufficient_quota: add credits" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		transientUpstream5xxMode: "retry",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: quotaFailure }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error, quotaFailure);
+	assert.equal(output.events.at(-1).reason, "error");
+});
+
+test("fallback mode still gives authentication failures the 50-retry campaign", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const authFailure = assistant({ errorStatus: 403, errorMessage: "Forbidden" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		transientUpstream5xxMode: "fallback",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: authFailure }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 2);
+	assert.equal(output.events.at(-1).error, authFailure);
+});
+
+test("retry-5m keeps model failures on the 50-retry budget rather than its wall-clock window", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const modelFailure = assistant({ errorStatus: 503, errorMessage: "no capacity for model" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 0,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: modelFailure }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error, modelFailure);
+});
+
+test("retry-5m keeps 503 authentication failures on the 50-retry budget", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const authFailure = assistant({ errorStatus: 503, errorMessage: "authentication_error: credentials revoked" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 2,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 0,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: authFailure }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 3);
+	assert.equal(output.events.at(-1).error, authFailure);
 });
 
 test("isolated retry backoff honors cancellation without touching shared recovery state", async () => {
@@ -1921,18 +2215,24 @@ test("stream wrapper never replays a rate limit after substantive content", asyn
 	assert.equal(output.events.at(-1).error, error);
 });
 
-test("stream wrapper forwards unavailable errors unchanged for OMP fallback", async () => {
+test("stream wrapper retries model-unavailable errors before forwarding the final failure", async () => {
 	const rootDir = await tempRoot();
 	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
 	const unavailable = assistant({ errorStatus: 503, errorMessage: "model unavailable", errorId: 123 });
+	let attempts = 0;
 	const output = createAdaptiveStream({
 		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
 		requestOptions: { apiKey: "test" },
 		queue,
+		maxRetries: 2,
 		createOutputStream: () => new FakeOutputStream(),
-		createInputStream: () => new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]);
+		},
 	});
 	await output.completion.promise;
+	assert.equal(attempts, 3);
 	assert.equal(output.events.length, 1);
 	assert.equal(output.events[0].error, unavailable);
 });

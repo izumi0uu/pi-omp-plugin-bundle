@@ -4,13 +4,15 @@ export const RETRY_PROGRESS_STATUS_KEY = "adaptive-provider-queue:retry-progress
 const PROGRESS_BAR_WIDTH = 12;
 const SHARED_RETRY_STATUS_CONTROLLER = Symbol.for("omp.adaptive-provider-queue.retry-progress.v1");
 
+export type RetryProgressKind = RetryFailureKind | "provider";
+
 export interface AdaptiveRetryProgress {
 	readonly provider: string;
 	readonly model?: string;
 	readonly phase: "queued" | "backoff" | "requesting";
 	readonly attempt: number;
 	readonly maxRetries: number;
-	readonly kind?: RetryFailureKind;
+	readonly kind?: RetryProgressKind;
 	readonly queuePosition?: number;
 	readonly queueDepth?: number;
 	readonly retryWindowMs?: number;

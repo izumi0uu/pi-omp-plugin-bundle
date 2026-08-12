@@ -1,21 +1,26 @@
 # OMP Provider Retry And Fallback Strategy
 
-记录日期：2026-08-11。当前验证版本：OMP 17.2.12。
+记录日期：2026-08-12。当前验证版本：OMP 17.2.12。
 
 ## 目标
 
 - 正常请求不设置固定并发上限。
-- 真实请求返回限流或可恢复的传输错误时，默认在当前请求内独立重试，不创建共享队列。
+- 真实请求返回插件管理的 provider 错误时，默认在当前请求内独立重试，不创建共享队列。
 - 临时上游 `502/503/504`、`server_is_overloaded`、`stream_read_error`、超时、连接断开和不完整流与限流共享
   当前请求的 50 次预算，避免瞬时服务拥塞或传输波动过早触发 fallback。
 - 跨窗口 FIFO 和共享恢复预算保留为 session 级可选模式，默认关闭；需要时才让同一
   endpoint + credential lane 的窗口共享一次恢复活动。
 - 允许单个 session 把普通 HTTP `502/503/504` 改为首次失败后立即进入 OMP fallback，
-  不改变并发限流、明确服务器过载、断流、鉴权、额度和模型不可用的既有路由。
+  不改变并发限流、明确服务器过载、断流、鉴权、额度和模型不可用的 50 次路由。
 - 也允许单个 session 在同一 provider 上最多重试普通 `502/503/504` 五分钟，期间可
   Esc 取消；到期后才进入 fallback，给用户保留阻止跨账号切换的反应窗口。
+- 允许单个 session 对插件管理的错误使用本地 50 次预算，耗尽后直接结束当前
+  turn，不进入 OMP fallback；其中包括鉴权、额度、billing 和明确模型不可用。
 - OMP 外层不再为同一个 `5xx` 启动第二套重试循环。
 - fallback 失败后保留冷却，避免无限来回切换；同时提供一次有界的原生 transport 尝试。
+
+本文的“50 次预算”均指最多 50 次重试：连同第一次请求，最坏情况下会向 provider
+发出 51 次请求。
 
 ## 当前角色
 
@@ -30,9 +35,9 @@ modelRoles:
 ```
 
 `default`、`slow`、`plan` 和 `designer` 都使用 adaptive retry transport。主模型在
-输出正文、tool call 或图片前遇到限流、明确的临时服务器过载或可恢复传输错误时，会
-执行同一套 50 次分段重试；遇到鉴权、额度、明确的模型不可用或其他非瞬态错误时才立即
-进入 fallback。手动选择普通 `aiinput` 或 `kimi-code` 会绕过这套内部重试并采用
+输出正文、tool call 或图片前遇到限流、鉴权/权限错误、额度/billing、明确模型/容量/
+路由不可用、临时服务器过载或可恢复传输错误时，会执行同一套 50 次分段重试。普通
+`400` 请求错误等未分类错误仍直接进入 fallback。手动选择普通 `aiinput` 或 `kimi-code` 会绕过这套内部重试并采用
 fail-fast 行为，与 queued selector 不会自动互换。
 
 ## 重试归属
@@ -54,7 +59,7 @@ retry:
 | 31-40 | 每次 3 分钟 |
 | 41-50 | 每次 5 分钟封顶 |
 
-限流和可恢复传输错误共享当前请求的同一个计数器，不会分别获得两套预算。只有 thinking 的流
+上述 provider 错误共享当前请求的同一个计数器，不会分别获得多套预算。只有 thinking 的流
 仍可重试，后续尝试会抑制重复的 thinking 和 stream envelope；一旦已经输出正文、
 tool call 或图片，就不重放。手动取消会立即中断等待；默认隔离模式没有需要保留的 lane 状态。
 
@@ -77,7 +82,7 @@ tool call 或图片，就不重放。手动取消会立即中断等待；默认�
 - 开关在每个请求开始时取值。切换不会迁移或中断已经运行的请求，只影响后续请求。
 - `off` 不删除旧窗口仍可能使用的共享状态文件；关闭时忽略它们。若其过期前重新打开，
   新请求可能继续观察到该共享活动或 exhaustion 缓存。
-- 状态栏合并显示两个策略，例如 `5xx: retry 50x | shared: off`。
+- 状态栏合并显示两个策略，例如 `5xx: retry 50x -> fallback | shared: off`。
 - 本地重试进度不显示队列位置：`TokenKing retry 2/50 [#-----------] transport`。
   共享模式才追加 `q1/2` 等 FIFO 位置。
 
@@ -85,29 +90,41 @@ tool call 或图片，就不重放。手动取消会立即中断等待；默认�
 
 ```text
 /adaptive-5xx status
+/adaptive-5xx list
 /adaptive-5xx retry
+/adaptive-5xx retry-stop
 /adaptive-5xx retry-5m
 /adaptive-5xx fallback
 /adaptive-5xx toggle
 ```
 
+命令名为兼容旧 session 记录而保留；它现在同时决定所有插件管理错误在 50 次预算耗尽后
+是进入 fallback 还是停止。`fallback` 和 `retry-5m` 仍只特殊处理普通 `502/503/504`。
+
 - 新 session 默认为 `retry`，普通 `502/503/504` 使用当前选择的本地或共享 50 次预算。
+- `retry-stop` 对普通 `502/503/504`、concurrency/rate limit、鉴权/权限、额度/billing、
+  明确模型/容量/路由不可用、overload、断流和 transport failure 使用 request-local
+  50 次预算；耗尽后发送带明确原因的
+  `aborted` 终态并结束当前 turn，OMP 不会进入 fallback chain。该模式强制 shared
+  为 `off`，避免其他窗口改变 50 次预算。
 - `retry-5m` 从第一次普通 `502/503/504` 开始计算五分钟墙钟窗口，窗口内沿用现有
   分段退避并继续请求当前 provider；任意一次成功就留在当前 provider，五分钟仍失败
   才把最后一个错误交给 OMP fallback。退避跨越 deadline 时只等待剩余时间，不会在
   deadline 后再发一次请求；deadline 到达时仍在途的探测会被中止，并交回此前最后一个
   普通 5xx。正文、tool call 或图片一旦开始就撤销 deadline，正常长回答可继续完成。
   Esc 会取消当前 turn，不触发 fallback；与 deadline 竞态时也以用户取消优先。
-- 固定墙钟窗口是 request-local 策略。选择 `retry-5m` 会把当前 session 的
+- `retry-stop` 和固定墙钟窗口都是 request-local 策略。选择两者之一会把当前 session 的
   `/adaptive-share` 设为 `off`；该模式下不能重新打开 shared，必须先选择 `retry` 或
-  `fallback`。这样其他窗口和旧共享 campaign 不会延长这五分钟。
+  `fallback`。这样其他窗口和旧共享 campaign 不会改变当前预算。
 - `fallback` 模式下，普通 `502/503/504` 的首次失败直接交给 OMP fallback。
+- `list` 显示所有模式并标出当前模式。`toggle` 固定按
+  `retry -> retry-stop -> retry-5m -> fallback -> retry` 循环。
 - 选择写入当前 session JSONL；`/resume` 会恢复。fork 的活动分支包含该记录时会继承。
 - `/new` 没有旧记录，因此回到默认 `retry`。
 - root session 创建的 subagent 沿用 root 当前模式。
 - detached 或嵌套 subagent 会按稳定的 artifacts lineage 绑定原 root；即使 UI 后来
   switch 到另一个 session，也不会改用新 session 的策略。
-- 三种模式都与共享开关一起持续显示在状态栏。
+- 四种模式都与共享开关一起持续显示在状态栏。
 - 实际进入恢复后，同一个可覆盖的状态槽会显示 provider、`attempt/50` 进度条和错误类型；
   共享模式还显示队列位置。成功、取消或最终失败后清除，
   不会为每次重试叠加通知。只有携带当前交互 session ID 的请求能写入该槽位；
@@ -115,11 +132,11 @@ tool call 或图片，就不重放。手动取消会立即中断等待；默认�
 - `retry-5m` 改用时间进度条，例如
   `AI Input retry 4 [#####-------] 5xx fallback in 3m12s`，长退避和在途探测期间每秒原位刷新。
 - `/tree` 跳转到其他历史节点时，会按新活动分支重新恢复策略。
-- 开关不影响明确的 concurrency/rate limit、`server_is_overloaded`、
+- 开关不影响明确的 concurrency/rate limit、鉴权/权限、额度/billing、明确 model/
+  capacity/route unavailable、`server_is_overloaded`、
   `stream_read_error`、无 HTTP 状态的 timeout/socket/network failure；即使明确限流或
   server overload 同时带有 `502/503/504`，这些仍使用独立的 50 次预算重试，不会继承
   普通 5xx 的 deadline，普通 5xx 尝试也不会提前消耗这份 50 次预算。
-- 开关也不影响鉴权、额度、billing、明确 model unavailable；这些仍立即交给 fallback。
 - OMP 切到下一个 fallback provider 后会创建新的 provider 请求；如果它也返回普通
   `502/503/504`，会从自己的第一次普通 5xx 开始计算新的五分钟窗口。
 
@@ -161,16 +178,18 @@ owner；旧格式 ticket 可以安全共存。所有旧窗口完成 `/reload` �
 |---|---|
 | 输出正文/tool/image 前的 `429`、concurrency、rate limit | 使用当前选择的本地/共享 50 次预算 |
 | 普通上游 `502/503/504`，session 为默认 `retry` | 使用当前选择的本地/共享 50 次预算 |
+| 插件管理的 provider 错误，session 为 `retry-stop` | 本地重试最多 50 次；耗尽后结束 turn，不 fallback |
 | 普通上游 `502/503/504`，session 为 `retry-5m` | 在当前 provider 本地重试最多五分钟；成功则继续，到期才 fallback |
 | 普通上游 `502/503/504`，session 为 `fallback` | 首次失败直接交给 OMP fallback |
-| 明确的 `server_is_overloaded` 同义响应 | 三种 5xx 模式都使用当前选择的本地/共享 50 次预算 |
+| 明确的 `server_is_overloaded` 同义响应 | 使用 50 次预算；`retry-stop` 耗尽后结束而非 fallback |
 | 输出正文/tool/image 前的 `stream_read_error`、timeout、socket/fetch/network failure、不完整流 | 使用当前选择的本地/共享 50 次预算 |
-| `401`、`403`、token revoked | 立即交给 OMP fallback |
-| quota、billing、credit、balance exhausted | 立即交给 OMP fallback |
-| model unavailable、no capacity、其他非瞬态 `5xx` | 立即交给 OMP fallback |
+| `401/402/403`、token revoked/invalid、权限或付款错误 | 使用 50 次预算 |
+| quota、billing、credit、balance exhausted | 使用 50 次预算 |
+| 明确 model/capacity/route unavailable | 使用 50 次预算 |
 | 已产生文本、tool call 或图片后的错误 | 不重放，直接结束当前流 |
 | 隔离模式第 50 次重试仍失败 | 把最后一次原始错误交给 OMP fallback，不保留共享状态 |
 | 共享模式第 50 次重试仍失败 | 把最后一次错误交给 OMP fallback，并缓存 lane exhaustion 5 分钟 |
+| `retry-stop` 第 50 次重试仍失败 | 返回明确的 aborted 终态并结束 turn，不进入 fallback chain |
 | 共享 lane exhaustion 缓存期间的新请求或等待者 | 不访问上游，直接交给 OMP fallback |
 
 ## Fallback Chain

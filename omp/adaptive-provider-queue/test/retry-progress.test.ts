@@ -34,6 +34,10 @@ test("retry progress renders a compact fixed-width ASCII bar", () => {
 		"TokenKing retry 50/50 [############] rate limit q1/1",
 	);
 	assert.equal(
+		formatRetryProgress({ ...retrying, attempt: 1, kind: "provider", queuePosition: undefined, queueDepth: undefined }),
+		"TokenKing retry 1/50 [#-----------] provider",
+	);
+	assert.equal(
 		formatRetryProgress({
 			...retrying,
 			provider: "aiinput-overseas-queued",
