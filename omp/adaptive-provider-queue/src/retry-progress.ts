@@ -13,6 +13,8 @@ export interface AdaptiveRetryProgress {
 	readonly kind?: RetryFailureKind;
 	readonly queuePosition?: number;
 	readonly queueDepth?: number;
+	readonly retryWindowMs?: number;
+	readonly retryWindowRemainingMs?: number;
 }
 
 export interface RetryStatusTarget {
@@ -35,10 +37,25 @@ function progressBar(attempt: number, maxRetries: number): string {
 	return `[${"#".repeat(filled)}${"-".repeat(PROGRESS_BAR_WIDTH - filled)}]`;
 }
 
+function remainingTime(ms: number): string {
+	const seconds = Math.max(0, Math.ceil(ms / 1_000));
+	if (seconds === 0) return "now";
+	const minutes = Math.floor(seconds / 60);
+	const remainder = seconds % 60;
+	return minutes > 0 ? `${minutes}m${remainder.toString().padStart(2, "0")}s` : `${remainder}s`;
+}
+
 export function formatRetryProgress(progress: AdaptiveRetryProgress): string {
 	const provider = PROVIDER_LABELS[progress.provider] ?? progress.provider;
 	const attempt = Math.max(0, Math.floor(progress.attempt));
 	const maxRetries = Math.max(0, Math.floor(progress.maxRetries));
+	if (progress.retryWindowMs !== undefined && progress.retryWindowRemainingMs !== undefined) {
+		const windowMs = Math.max(1, Math.floor(progress.retryWindowMs));
+		const remainingMs = Math.max(0, Math.min(windowMs, Math.floor(progress.retryWindowRemainingMs)));
+		const elapsedMs = windowMs - remainingMs;
+		const count = attempt > 0 ? ` ${attempt}` : "";
+		return `${provider} retry${count} ${progressBar(elapsedMs, windowMs)} 5xx fallback in ${remainingTime(remainingMs)}`;
+	}
 	const action = progress.phase === "queued" ? "queued" : "retry";
 	const count = attempt > 0 ? ` ${attempt}/${maxRetries}` : "";
 	const kind = progress.kind === "rate-limit" ? " rate limit" : progress.kind ? ` ${progress.kind}` : "";

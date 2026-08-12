@@ -86,12 +86,16 @@ test("transport and generic upstream errors use distinct adaptive retry classes"
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "Bad gateway" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 504, errorMessage: "Gateway timeout" }), false);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "stream_read_error" }), true);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "socket connection was closed unexpectedly" }), true);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 500, errorMessage: "Internal server error" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "model unavailable" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorMessage: "model overloaded" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 502, errorMessage: "Bad gateway" }), true);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), true);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 504, errorMessage: "Gateway timeout" }), true);
+	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "stream_read_error" }), false);
+	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 502, errorMessage: "socket connection was closed unexpectedly" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 500, errorMessage: "Internal server error" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "model unavailable" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Our servers are currently overloaded" }), false);
@@ -583,6 +587,21 @@ class FakeInputStream implements AsyncIterable<any> {
 	}
 }
 
+function abortableHangingInput(signal?: AbortSignal) {
+	return {
+		async *[Symbol.asyncIterator]() {
+			await new Promise<never>((_resolve, reject) => {
+				const rejectFromSignal = () => reject(signal?.reason ?? new DOMException("Request aborted", "AbortError"));
+				if (signal?.aborted) rejectFromSignal();
+				else signal?.addEventListener("abort", rejectFromSignal, { once: true });
+			});
+		},
+		async result() {
+			return assistant();
+		},
+	};
+}
+
 class FakeOutputStream {
 	events: any[] = [];
 	done = false;
@@ -951,6 +970,414 @@ test("a generic 503 uses adaptive retry by default", async () => {
 
 	await output.completion.promise;
 	assert.equal(attempts.length, 0);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+});
+
+test("retry-5m retries generic 5xx only until its wall-clock window expires", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 30, maxDelayMs: 30, random: () => 0 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	let upstreamCalls = 0;
+	let clockMs = 0;
+	const sleeps: number[] = [];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 50,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 100,
+		sharedRetryRecovery: true,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			return new FakeInputStream([
+				{ type: "start", partial: assistant() },
+				{ type: "error", reason: "error", error: unavailable },
+			]);
+		},
+		now: () => clockMs,
+		sleep: async delayMs => {
+			sleeps.push(delayMs);
+			clockMs += delayMs;
+		},
+	});
+
+	await output.completion.promise;
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(upstreamCalls, 4);
+	assert.deepEqual(sleeps, [30, 30, 30, 10]);
+	assert.equal(output.events.at(-1).error, unavailable);
+});
+
+test("retry-5m keeps the current provider when generic 5xx recovers inside the window", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 20, maxDelayMs: 20, random: () => 0 });
+	const unavailable = assistant({ errorStatus: 502, errorMessage: "Bad gateway" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	let upstreamCalls = 0;
+	let clockMs = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 100,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			return upstreamCalls < 3
+				? new FakeInputStream([{ type: "error", reason: "error", error: unavailable }])
+				: new FakeInputStream([
+						{ type: "start", partial: succeeded },
+						{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+						{ type: "done", reason: "stop", message: succeeded },
+					]);
+		},
+		now: () => clockMs,
+		sleep: async delayMs => {
+			clockMs += delayMs;
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(upstreamCalls, 3);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+});
+
+test("retry-5m applies the same deadline when generic 5xx is thrown before streaming", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 25, maxDelayMs: 25, random: () => 0 });
+	const unavailable = assistant({ errorStatus: 504, errorMessage: "Gateway timeout" });
+	let upstreamCalls = 0;
+	let clockMs = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 60,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			throw unavailable;
+		},
+		now: () => clockMs,
+		sleep: async delayMs => {
+			clockMs += delayMs;
+		},
+	});
+
+	await assert.rejects(output.completion.promise, error => error === unavailable);
+	assert.equal(upstreamCalls, 3);
+});
+
+test("retry-5m cancellation stops before fallback and never touches shared state", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 1_000, maxDelayMs: 1_000 });
+	const sharedCalls = rejectSharedRetryCalls(queue);
+	const controller = new AbortController();
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const progress: Array<AdaptiveRetryProgress | undefined> = [];
+	let upstreamCalls = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test", signal: controller.signal },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		sharedRetryRecovery: true,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]);
+		},
+		onProgress: value => progress.push(value),
+	});
+
+	await waitUntil(async () => progress.some(value => value?.phase === "backoff"));
+	controller.abort();
+	await assert.rejects(output.completion.promise, error => error instanceof Error && error.name === "AbortError");
+	assert.deepEqual(sharedCalls, []);
+	assert.equal(upstreamCalls, 1);
+	assert.equal(output.events.some(event => event.type === "error"), false);
+});
+
+test("retry-5m aborts an in-flight retry at the deadline and forwards the last 503 event", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	let upstreamCalls = 0;
+	let retrySignal: AbortSignal | undefined;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 20,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: signal => {
+			upstreamCalls += 1;
+			if (upstreamCalls === 1) {
+				return new FakeInputStream([
+					{ type: "start", partial: assistant() },
+					{ type: "error", reason: "error", error: unavailable },
+				]);
+			}
+			retrySignal = signal;
+			return abortableHangingInput(signal);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(upstreamCalls, 2);
+	assert.equal(retrySignal?.aborted, true);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "error"]);
+	assert.equal(output.events.at(-1).error, unavailable);
+});
+
+test("retry-5m preserves a thrown 504 when an in-flight retry reaches the deadline", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const unavailable = assistant({ errorStatus: 504, errorMessage: "Gateway timeout" });
+	let upstreamCalls = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 20,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: signal => {
+			upstreamCalls += 1;
+			if (upstreamCalls === 1) throw unavailable;
+			return abortableHangingInput(signal);
+		},
+	});
+
+	await assert.rejects(output.completion.promise, error => error === unavailable);
+	assert.equal(upstreamCalls, 2);
+});
+
+test("retry-5m does not start another request when the wall clock expires before timer dispatch", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 20, maxDelayMs: 20, random: () => 0 });
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	let upstreamCalls = 0;
+	let clockMs = 0;
+	const scheduledDelays: number[] = [];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 100,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			if (upstreamCalls > 1) throw new Error("request started after the retry deadline");
+			return new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]);
+		},
+		now: () => clockMs,
+		sleep: async delayMs => {
+			clockMs += delayMs;
+		},
+		scheduleTimeout: (_callback, delayMs) => {
+			scheduledDelays.push(delayMs);
+			clockMs += delayMs;
+			return () => {};
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(upstreamCalls, 1);
+	assert.deepEqual(scheduledDelays, [80]);
+	assert.equal(output.events.at(-1).error, unavailable);
+});
+
+test("retry-5m rejects substantive output observed after the wall-clock deadline", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 20, maxDelayMs: 20, random: () => 0 });
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "late" }] });
+	let upstreamCalls = 0;
+	let clockMs = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 100,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			if (upstreamCalls === 1) {
+				return new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]);
+			}
+			return {
+				async *[Symbol.asyncIterator]() {
+					clockMs = 101;
+					yield { type: "start", partial: succeeded };
+					yield { type: "text_delta", contentIndex: 0, delta: "late", partial: succeeded };
+					yield { type: "done", reason: "stop", message: succeeded };
+				},
+				async result() {
+					return succeeded;
+				},
+			};
+		},
+		now: () => clockMs,
+		sleep: async delayMs => {
+			clockMs += delayMs;
+		},
+		scheduleTimeout: () => () => {},
+	});
+
+	await output.completion.promise;
+	assert.equal(upstreamCalls, 2);
+	assert.deepEqual(output.events.map(event => event.type), ["error"]);
+	assert.equal(output.events.at(-1).error, unavailable);
+});
+
+test("retry-5m keeps explicit overload, rate limit and stream failures on their separate retry budget", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 1, maxDelayMs: 1, random: () => 0 });
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const limited = assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" });
+	const overloaded = assistant({
+		errorStatus: 503,
+		errorMessage: "Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+	});
+	const interrupted = assistant({
+		errorStatus: 503,
+		errorMessage: "Error Code stream_read_error: stream_read_error",
+	});
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const failures = [unavailable, limited, overloaded, interrupted];
+	let upstreamCalls = 0;
+	let clockMs = 0;
+	const progress: Array<AdaptiveRetryProgress | undefined> = [];
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 3,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 2,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			const failure = failures.shift();
+			return failure
+				? new FakeInputStream([{ type: "error", reason: "error", error: failure }])
+				: new FakeInputStream([
+						{ type: "start", partial: succeeded },
+						{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+						{ type: "done", reason: "stop", message: succeeded },
+					]);
+		},
+		now: () => clockMs,
+		sleep: async delayMs => {
+			clockMs += delayMs;
+		},
+		onProgress: value => progress.push(value),
+	});
+
+	await output.completion.promise;
+	assert.equal(upstreamCalls, 5);
+	assert.equal(clockMs > 2, true);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+	assert.equal(
+		progress.some(value => value?.kind === "rate-limit" && value.retryWindowMs !== undefined),
+		false,
+	);
+	assert.equal(
+		progress.some(value => value?.attempt === 3 && value.kind === "transport" && value.retryWindowMs === undefined),
+		true,
+	);
+});
+
+test("retry-5m user cancellation wins when a 503 event arrives in the abort race", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const controller = new AbortController();
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test", signal: controller.signal },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => ({
+			async *[Symbol.asyncIterator]() {
+				controller.abort();
+				yield { type: "error", reason: "error", error: unavailable };
+			},
+			async result() {
+				return unavailable;
+			},
+		}),
+	});
+
+	await assert.rejects(output.completion.promise, error => error instanceof Error && error.name === "AbortError");
+	assert.equal(output.events.length, 0);
+});
+
+test("retry-5m user cancellation wins when createInputStream throws a 503 in the abort race", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const controller = new AbortController();
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test", signal: controller.signal },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			controller.abort();
+			throw unavailable;
+		},
+	});
+
+	await assert.rejects(output.completion.promise, error => error instanceof Error && error.name === "AbortError");
+	assert.equal(output.events.length, 0);
+});
+
+test("retry-5m disables its deadline after substantive output starts", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	let upstreamCalls = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		transientUpstream5xxMode: "retry-5m",
+		upstream5xxRetryWindowMs: 20,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			upstreamCalls += 1;
+			if (upstreamCalls === 1) {
+				return new FakeInputStream([{ type: "error", reason: "error", error: unavailable }]);
+			}
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial: succeeded };
+					yield { type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded };
+					await sleepWithSignal(35);
+					yield { type: "done", reason: "stop", message: succeeded };
+				},
+				async result() {
+					return succeeded;
+				},
+			};
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(upstreamCalls, 2);
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 });
 

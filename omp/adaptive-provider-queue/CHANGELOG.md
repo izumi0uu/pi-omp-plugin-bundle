@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 - 2026-08-12
+
+- Add `/adaptive-5xx retry-5m`, which retries ordinary pre-content
+  `502/503/504` failures on the current provider for at most five wall-clock
+  minutes before allowing OMP fallback. Esc cancels the retry window without
+  switching providers.
+- Cap the final backoff at the remaining retry window and stop before another
+  upstream request once the deadline is reached. Abort an in-flight retry at the
+  deadline while preserving the last generic 5xx for fallback; remove the timer
+  after substantive output and make Esc win deadline races.
+- Keep explicit overload, rate-limit and transport failures on their independent
+  50-attempt budget even after a generic 5xx. Authentication, quota, model
+  availability and other immediate-fallback routing remain unchanged.
+- Keep the fixed window request-local by forcing shared recovery off in this
+  mode, persist the selection through resume and subagent lineage, and show a
+  replaceable time-based progress bar with the remaining fallback delay.
+
 ## 0.5.1 - 2026-08-11
 
 - Register `aiinput2-overseas-queued` for GPT 5.6 Sol on the overseas AI Input

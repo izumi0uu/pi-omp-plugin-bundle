@@ -10,6 +10,10 @@ import {
 	type RetryWindowDecision,
 } from "./queue.ts";
 import type { AdaptiveRetryProgress } from "./retry-progress.ts";
+import {
+	TRANSIENT_UPSTREAM_RETRY_WINDOW_MS,
+	type TransientUpstreamMode,
+} from "./session-policy.ts";
 
 interface AssistantLike {
 	stopReason?: string;
@@ -34,6 +38,27 @@ interface OutputStreamLike {
 	fail(error: unknown): void;
 }
 
+type ScheduledTimeoutCleanup = () => void;
+
+interface AttemptGuard {
+	readonly signal: AbortSignal;
+	readonly interrupted: Promise<never>;
+	deadlineExpired(): boolean;
+	disableDeadline(): void;
+	dispose(): void;
+}
+
+type TransientUpstreamFailure =
+	| { readonly type: "event"; readonly event: StreamEventLike; readonly prefix: readonly StreamEventLike[] }
+	| { readonly type: "throw"; readonly error: unknown; readonly prefix: readonly StreamEventLike[] };
+
+class TransientUpstreamRetryWindowExpiredError extends Error {
+	constructor() {
+		super("Adaptive provider 5xx retry window expired");
+		this.name = "TransientUpstreamRetryWindowExpiredError";
+	}
+}
+
 export interface QueueLogger {
 	info?(message: string, fields?: Record<string, unknown>): void;
 	warn?(message: string, fields?: Record<string, unknown>): void;
@@ -44,12 +69,18 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	requestOptions?: { apiKey?: unknown; signal?: AbortSignal; [key: string]: unknown };
 	queue: AdaptiveProviderQueue;
 	maxRetries?: number;
+	transientUpstream5xxMode?: TransientUpstreamMode;
+	upstream5xxRetryWindowMs?: number;
+	/** @deprecated Use transientUpstream5xxMode. */
 	retryTransientUpstream5xx?: boolean;
 	sharedRetryRecovery?: boolean;
 	createOutputStream(): TOutput;
-	createInputStream(): InputStreamLike;
+	createInputStream(signal?: AbortSignal): InputStreamLike;
 	logger?: QueueLogger;
 	onProgress?(progress: AdaptiveRetryProgress | undefined): void;
+	now?(): number;
+	sleep?(ms: number, signal?: AbortSignal): Promise<void>;
+	scheduleTimeout?(callback: () => void, delayMs: number): ScheduledTimeoutCleanup;
 }
 
 export const DEFAULT_MAX_RETRIES = 50;
@@ -77,6 +108,8 @@ const TRANSIENT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit(?:ed| exceeded)?|retry (?:again )?later/i;
 const EXPLICIT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit[_ -]?exceeded|rate limit exceeded/i;
+const EXPLICIT_TRANSIENT_TRANSPORT_PATTERN =
+	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
 const TRANSIENT_TRANSPORT_PATTERN =
 	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
 const TRANSIENT_UPSTREAM_STATUSES = new Set([502, 503, 504]);
@@ -124,15 +157,19 @@ export function isAdaptiveTransientTransport(error: unknown): boolean {
 	const text = errorText(error);
 	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
 	const status = errorStatus(error);
-	if (status !== undefined) return false;
 	if (isAdaptiveRateLimit(error)) return false;
-	return TRANSIENT_TRANSPORT_PATTERN.test(text);
+	if (status === undefined) return TRANSIENT_TRANSPORT_PATTERN.test(text);
+	return TRANSIENT_UPSTREAM_STATUSES.has(status) && EXPLICIT_TRANSIENT_TRANSPORT_PATTERN.test(text);
 }
 
 export function isAdaptiveTransientUpstream(error: unknown): boolean {
 	const text = errorText(error);
 	if (QUOTA_OR_BILLING_PATTERN.test(text) || MODEL_UNAVAILABLE_PATTERN.test(text)) return false;
-	return TRANSIENT_UPSTREAM_STATUSES.has(errorStatus(error) ?? 0) && !isAdaptiveRateLimit(error);
+	return (
+		TRANSIENT_UPSTREAM_STATUSES.has(errorStatus(error) ?? 0) &&
+		!isAdaptiveRateLimit(error) &&
+		!isAdaptiveTransientTransport(error)
+	);
 }
 
 function transientUpstreamStatus(error: unknown): number | undefined {
@@ -190,12 +227,98 @@ function isCancellation(error: unknown, signal?: AbortSignal): boolean {
 	return candidate.stopReason === "aborted" || candidate.reason === "aborted";
 }
 
+function cancellationError(): Error {
+	return new DOMException("Adaptive provider request aborted", "AbortError");
+}
+
+function defaultScheduleTimeout(callback: () => void, delayMs: number): ScheduledTimeoutCleanup {
+	const timer = setTimeout(callback, Math.max(0, delayMs));
+	return () => clearTimeout(timer);
+}
+
+function createAttemptGuard(options: {
+	parentSignal?: AbortSignal;
+	deadlineAt?: number;
+	now(): number;
+	scheduleTimeout(callback: () => void, delayMs: number): ScheduledTimeoutCleanup;
+}): AttemptGuard | undefined {
+	if (!options.parentSignal && options.deadlineAt === undefined) return undefined;
+	const controller = new AbortController();
+	const interruption = Promise.withResolvers<never>();
+	void interruption.promise.catch(() => {});
+	let interrupted = false;
+	let expired = false;
+	let deadlineActive = options.deadlineAt !== undefined;
+	let cancelDeadline: ScheduledTimeoutCleanup | undefined;
+	const interrupt = (error: Error) => {
+		if (interrupted) return;
+		interrupted = true;
+		controller.abort(error);
+		interruption.reject(error);
+	};
+	const onParentAbort = () => interrupt(cancellationError());
+	options.parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+	if (options.parentSignal?.aborted) onParentAbort();
+	if (options.deadlineAt !== undefined) {
+		cancelDeadline = options.scheduleTimeout(() => {
+			if (!deadlineActive) return;
+			expired = true;
+			interrupt(new TransientUpstreamRetryWindowExpiredError());
+		}, Math.max(0, options.deadlineAt - options.now()));
+	}
+	return {
+		signal: controller.signal,
+		interrupted: interruption.promise,
+		deadlineExpired: () =>
+			expired || (deadlineActive && options.deadlineAt !== undefined && options.deadlineAt <= options.now()),
+		disableDeadline: () => {
+			deadlineActive = false;
+			cancelDeadline?.();
+			cancelDeadline = undefined;
+		},
+		dispose: () => {
+			cancelDeadline?.();
+			cancelDeadline = undefined;
+			options.parentSignal?.removeEventListener("abort", onParentAbort);
+		},
+	};
+}
+
+async function* guardedEvents(input: InputStreamLike, guard: AttemptGuard | undefined): AsyncIterable<StreamEventLike> {
+	const iterator = input[Symbol.asyncIterator]();
+	try {
+		while (true) {
+			const next = guard
+				? await Promise.race([iterator.next(), guard.interrupted])
+				: await iterator.next();
+			if (next.done) return;
+			yield next.value;
+		}
+	} finally {
+		try {
+			const returned = iterator.return?.();
+			if (returned) void Promise.resolve(returned).catch(() => {});
+		} catch {
+			// The attempt is already terminal; iterator cleanup must not replace its result.
+		}
+	}
+}
+
 export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: AdaptiveStreamOptions<TOutput>): TOutput {
 	const output = options.createOutputStream();
 	const signal = options.requestOptions?.signal;
+	const now = options.now ?? Date.now;
+	const sleep = options.sleep ?? sleepWithSignal;
+	const scheduleTimeout = options.scheduleTimeout ?? defaultScheduleTimeout;
 	const maxRetries = Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES));
-	const retryTransientUpstream5xx = options.retryTransientUpstream5xx ?? true;
-	const sharedRetryRecovery = options.sharedRetryRecovery ?? false;
+	const transientUpstream5xxMode =
+		options.transientUpstream5xxMode ?? (options.retryTransientUpstream5xx === false ? "fallback" : "retry");
+	const retryTransientUpstream5xx = transientUpstream5xxMode !== "fallback";
+	const upstream5xxRetryWindowMs = Math.max(
+		0,
+		Math.floor(options.upstream5xxRetryWindowMs ?? TRANSIENT_UPSTREAM_RETRY_WINDOW_MS),
+	);
+	const sharedRetryRecovery = transientUpstream5xxMode === "retry-5m" ? false : (options.sharedRetryRecovery ?? false);
 	const laneId = createLaneId({
 		provider: options.model.provider,
 		baseUrl: options.model.baseUrl,
@@ -210,10 +333,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		let emittedTextStart = false;
 		let emittedThinking = false;
 		let localRetryAttempt = 0;
+		let transientUpstreamRetryAttempt = 0;
+		let transientUpstreamRetryDeadlineAt: number | undefined;
+		let nextAttemptUsesTransientUpstreamDeadline = false;
+		let lastTransientUpstreamFailure: TransientUpstreamFailure | undefined;
 		let progressAttempt = 0;
 		let progressMaxRetries = maxRetries;
 		let progressKind: RetryFailureKind | undefined;
 		let progressPosition: QueuePosition | undefined;
+		let progressUsesTransientUpstreamWindow = false;
 		const progressEnabled = options.onProgress !== undefined;
 		let progressErrorLogged = false;
 		const updateProgressState = (state: LaneRetryState | undefined) => {
@@ -225,6 +353,10 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		const publishProgress = (phase: AdaptiveRetryProgress["phase"]) => {
 			if (!progressEnabled) return;
 			try {
+				const retryWindowRemainingMs =
+					!progressUsesTransientUpstreamWindow || transientUpstreamRetryDeadlineAt === undefined
+						? undefined
+						: Math.max(0, transientUpstreamRetryDeadlineAt - now());
 				options.onProgress?.({
 					provider: options.model.provider,
 					model: options.model.id,
@@ -234,6 +366,8 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					kind: progressKind,
 					queuePosition: progressPosition?.position,
 					queueDepth: progressPosition?.depth,
+					retryWindowMs: retryWindowRemainingMs === undefined ? undefined : upstream5xxRetryWindowMs,
+					retryWindowRemainingMs,
 				});
 				progressErrorLogged = false;
 			} catch (error) {
@@ -360,12 +494,31 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					error: unknown,
 					kind: "rate-limit" | "transport",
 				): Promise<boolean> => {
+					const usesTransientUpstreamWindow =
+						transientUpstream5xxMode === "retry-5m" && isAdaptiveTransientUpstream(error);
+					if (usesTransientUpstreamWindow && transientUpstreamRetryDeadlineAt === undefined) {
+						transientUpstreamRetryDeadlineAt = now() + upstream5xxRetryWindowMs;
+					}
+					if (
+						usesTransientUpstreamWindow &&
+						transientUpstreamRetryDeadlineAt !== undefined &&
+						now() >= transientUpstreamRetryDeadlineAt
+					) {
+						options.logger?.warn?.("adaptive provider 5xx retry window expired", {
+							provider: options.model.provider,
+							model: options.model.id,
+							attempt: localRetryAttempt,
+							windowMs: upstream5xxRetryWindowMs,
+						});
+						return false;
+					}
 					const retryAfterMs = retryAfterMsFromError(error);
-					if (localRetryAttempt >= maxRetries) {
+					if (!usesTransientUpstreamWindow && localRetryAttempt >= maxRetries) {
 						progressAttempt = localRetryAttempt;
 						progressMaxRetries = maxRetries;
 						progressKind = kind;
 						progressPosition = undefined;
+						progressUsesTransientUpstreamWindow = false;
 						publishProgress("backoff");
 						options.logger?.warn?.("adaptive provider isolated retry limit reached", {
 							provider: options.model.provider,
@@ -377,22 +530,56 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						return false;
 					}
 
-					localRetryAttempt += 1;
-					const delayMs = options.queue.backoffDelayMs(localRetryAttempt, retryAfterMs);
-					progressAttempt = localRetryAttempt;
+					const attempt = usesTransientUpstreamWindow
+						? ++transientUpstreamRetryAttempt
+						: ++localRetryAttempt;
+					const backoffDelayMs = options.queue.backoffDelayMs(attempt, retryAfterMs);
+					const remainingWindowMs =
+						!usesTransientUpstreamWindow || transientUpstreamRetryDeadlineAt === undefined
+							? undefined
+							: Math.max(0, transientUpstreamRetryDeadlineAt - now());
+					const delayMs =
+						remainingWindowMs === undefined ? backoffDelayMs : Math.min(backoffDelayMs, remainingWindowMs);
+					progressAttempt = attempt;
 					progressMaxRetries = maxRetries;
 					progressKind = kind;
 					progressPosition = undefined;
+					progressUsesTransientUpstreamWindow = usesTransientUpstreamWindow;
 					publishProgress("backoff");
 					options.logger?.warn?.("adaptive provider isolated retry caught retryable error", {
 						provider: options.model.provider,
 						model: options.model.id,
 						kind,
-						attempt: localRetryAttempt,
+						attempt,
 						maxRetries,
 						delayMs,
+						remainingWindowMs,
 					});
-					await sleepWithSignal(delayMs, signal);
+					const countdown =
+						usesTransientUpstreamWindow && delayMs >= 1_000 && progressEnabled
+							? setInterval(() => publishProgress("backoff"), 1_000)
+							: undefined;
+					countdown?.unref?.();
+					try {
+						await sleep(delayMs, signal);
+					} finally {
+						if (countdown) clearInterval(countdown);
+					}
+					if (
+						usesTransientUpstreamWindow &&
+						transientUpstreamRetryDeadlineAt !== undefined &&
+						now() >= transientUpstreamRetryDeadlineAt
+					) {
+						publishProgress("backoff");
+						options.logger?.warn?.("adaptive provider 5xx retry window expired", {
+							provider: options.model.provider,
+							model: options.model.id,
+							attempt,
+							windowMs: upstream5xxRetryWindowMs,
+						});
+						return false;
+					}
+					nextAttemptUsesTransientUpstreamDeadline = usesTransientUpstreamWindow;
 					publishProgress("requesting");
 					replayCount += 1;
 					return true;
@@ -483,9 +670,73 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				const attemptStartedAt = sharedRetryRecovery
 					? await options.queue.captureRetryAttempt(laneId)
 					: {};
+				let attemptGuard: AttemptGuard | undefined;
+				let requestCountdown: ReturnType<typeof setInterval> | undefined;
+				const disposeAttemptGuard = () => {
+					if (requestCountdown) clearInterval(requestCountdown);
+					requestCountdown = undefined;
+					attemptGuard?.dispose();
+					attemptGuard = undefined;
+				};
+				const disableAttemptDeadline = () => {
+					if (requestCountdown) clearInterval(requestCountdown);
+					requestCountdown = undefined;
+					attemptGuard?.disableDeadline();
+				};
+				const forwardLastTransientUpstreamFailure = async () => {
+					if (signal?.aborted) throw cancellationError();
+					const failure = lastTransientUpstreamFailure;
+					if (!failure) throw new TransientUpstreamRetryWindowExpiredError();
+					replaySafeEvents.length = 0;
+					ticket = await releaseTicket(options.queue, ticket);
+					if (signal?.aborted) throw cancellationError();
+					for (const event of failure.prefix) pushEvent(event);
+					if (failure.type === "event") {
+						pushEvent(failure.event);
+						return;
+					}
+					throw failure.error;
+				};
 				try {
-					const input = options.createInputStream();
-					for await (const event of input) {
+					if (signal?.aborted) throw cancellationError();
+					const usesTransientUpstreamDeadline = nextAttemptUsesTransientUpstreamDeadline;
+					nextAttemptUsesTransientUpstreamDeadline = false;
+					if (
+						usesTransientUpstreamDeadline &&
+						transientUpstreamRetryDeadlineAt !== undefined &&
+						now() >= transientUpstreamRetryDeadlineAt
+					) {
+						await forwardLastTransientUpstreamFailure();
+						return;
+					}
+					attemptGuard = createAttemptGuard({
+						parentSignal: signal,
+						deadlineAt: usesTransientUpstreamDeadline ? transientUpstreamRetryDeadlineAt : undefined,
+						now,
+						scheduleTimeout,
+					});
+					if (attemptGuard?.deadlineExpired()) {
+						await forwardLastTransientUpstreamFailure();
+						return;
+					}
+					if (
+						usesTransientUpstreamDeadline &&
+						progressEnabled &&
+						transientUpstreamRetryDeadlineAt !== undefined &&
+						transientUpstreamRetryDeadlineAt - now() >= 1_000
+					) {
+						requestCountdown = setInterval(() => publishProgress("requesting"), 1_000);
+						requestCountdown.unref?.();
+					}
+					const input = options.createInputStream(attemptGuard?.signal ?? signal);
+					for await (const event of guardedEvents(input, attemptGuard)) {
+						if (signal?.aborted) throw cancellationError();
+						const deadlineExpired = attemptGuard?.deadlineExpired() ?? false;
+						if (event.type === "done" || event.type === "error") disposeAttemptGuard();
+						if (deadlineExpired) {
+							await forwardLastTransientUpstreamFailure();
+							return;
+						}
 						if (!replayUnsafe && isReplaySafeBoundary(event)) {
 							replaySafeEvents.push(event);
 							continue;
@@ -500,12 +751,24 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							!substantiveContentExists(event.error) &&
 							kind !== undefined
 						) {
+							if (
+								transientUpstream5xxMode === "retry-5m" &&
+								isAdaptiveTransientUpstream(event.error)
+							) {
+								lastTransientUpstreamFailure = {
+									type: "event",
+									event,
+									prefix: [...replaySafeEvents],
+								};
+							}
 							if (await waitForRetry(event.error, kind, attemptStartedAt)) {
 								retry = true;
 								break;
 							}
+							if (signal?.aborted) throw cancellationError();
 							flushReplaySafeEvents();
 							ticket = await releaseTicket(options.queue, ticket);
+							if (signal?.aborted) throw cancellationError();
 							pushEvent(event);
 							return;
 						}
@@ -515,6 +778,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						const eventHasSubstantiveOutput = isSubstantiveOutputEvent(event);
 						hasSubstantiveOutput ||= eventHasSubstantiveOutput;
 						if (eventHasSubstantiveOutput || substantiveContentExists(event.error)) {
+							disableAttemptDeadline();
 							await clearObservedRetryState();
 							ticket = await releaseTicket(options.queue, ticket);
 						} else if (
@@ -528,6 +792,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						if (event.type === "done" || event.type === "error") {
 							if (event.type === "done") await clearObservedRetryState();
 							ticket = await releaseTicket(options.queue, ticket);
+							if (signal?.aborted) throw cancellationError();
 							pushEvent(event);
 							return;
 						}
@@ -536,21 +801,39 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 
 					if (retry) continue;
 					if (!output.done) {
-						const result = await input.result();
+						const result = attemptGuard
+							? await Promise.race([input.result(), attemptGuard.interrupted])
+							: await input.result();
 						flushReplaySafeEvents();
 						throw new Error(`Provider stream ended without a terminal event (${result.stopReason ?? "unknown"})`);
 					}
 				} catch (error) {
+					const deadlineExpired = attemptGuard?.deadlineExpired() ?? false;
+					disposeAttemptGuard();
+					if (signal?.aborted) throw cancellationError();
+					if (deadlineExpired || error instanceof TransientUpstreamRetryWindowExpiredError) {
+						await forwardLastTransientUpstreamFailure();
+						return;
+					}
 					const cancelled = isCancellation(error, signal);
 					const kind = retryKind(error);
 					if (!cancelled && !hasSubstantiveOutput && kind !== undefined) {
+						if (
+							transientUpstream5xxMode === "retry-5m" &&
+							isAdaptiveTransientUpstream(error)
+						) {
+							lastTransientUpstreamFailure = { type: "throw", error, prefix: [...replaySafeEvents] };
+						}
 						if (await waitForRetry(error, kind, attemptStartedAt)) continue;
 					}
+					if (signal?.aborted) throw cancellationError();
 					flushReplaySafeEvents();
 					if (!hasSubstantiveOutput && !cancelled && ticket && !bypassesUpstreamRetry(error)) {
 						await options.queue.markRetryStateExhausted(ticket);
 					}
 					throw error;
+				} finally {
+					disposeAttemptGuard();
 				}
 			}
 		} catch (error) {

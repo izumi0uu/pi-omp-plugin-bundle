@@ -2,8 +2,9 @@ export const ADAPTIVE_5XX_POLICY_ENTRY = "adaptive-provider-queue:5xx-policy";
 export const ADAPTIVE_SHARE_POLICY_ENTRY = "adaptive-provider-queue:share-policy";
 export const DEFAULT_TRANSIENT_UPSTREAM_MODE = "retry" as const;
 export const DEFAULT_SHARED_RETRY_RECOVERY = false;
+export const TRANSIENT_UPSTREAM_RETRY_WINDOW_MS = 300_000;
 
-export type TransientUpstreamMode = "retry" | "fallback";
+export type TransientUpstreamMode = "retry" | "retry-5m" | "fallback";
 
 export interface SessionPolicyStore {
 	readonly version: 3;
@@ -25,7 +26,7 @@ interface SessionEntryLike {
 function modeFromData(data: unknown): TransientUpstreamMode | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const mode = (data as Record<string, unknown>).mode;
-	return mode === "retry" || mode === "fallback" ? mode : undefined;
+	return mode === "retry" || mode === "retry-5m" || mode === "fallback" ? mode : undefined;
 }
 
 function sharedRetryRecoveryFromData(data: unknown): boolean | undefined {
@@ -179,6 +180,7 @@ export function parseTransientUpstreamModeCommand(
 	const action = args.trim().toLowerCase();
 	if (!action || action === "status") return "status";
 	if (action === "retry" || action === "fallback") return action;
+	if (action === "retry-5m" || action === "retry5m" || action === "5m") return "retry-5m";
 	if (action === "toggle") return current === "retry" ? "fallback" : "retry";
 	return undefined;
 }
@@ -199,6 +201,11 @@ export function formatAdaptivePolicyStatus(
 	mode: TransientUpstreamMode,
 	sharedRetryRecovery: boolean,
 ): string {
-	const upstream = mode === "fallback" ? "5xx: immediate fallback" : "5xx: retry 50x";
+	const upstream =
+		mode === "fallback"
+			? "5xx: immediate fallback"
+			: mode === "retry-5m"
+				? "5xx: retry 5m -> fallback"
+				: "5xx: retry 50x";
 	return `${upstream} | shared: ${sharedRetryRecovery ? "on" : "off"}`;
 }

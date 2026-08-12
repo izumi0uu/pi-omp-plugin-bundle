@@ -33,6 +33,16 @@ test("retry progress renders a compact fixed-width ASCII bar", () => {
 		formatRetryProgress({ ...retrying, attempt: 50, kind: "rate-limit", queueDepth: 1 }),
 		"TokenKing retry 50/50 [############] rate limit q1/1",
 	);
+	assert.equal(
+		formatRetryProgress({
+			...retrying,
+			provider: "aiinput-overseas-queued",
+			attempt: 4,
+			retryWindowMs: 300_000,
+			retryWindowRemainingMs: 192_000,
+		}),
+		"AI Input overseas retry 4 [#####-------] 5xx fallback in 3m12s",
+	);
 });
 
 test("one status slot is replaced and stale streams cannot clear newer progress", () => {

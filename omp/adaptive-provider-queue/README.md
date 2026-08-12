@@ -49,12 +49,21 @@ Generic HTTP `502/503/504` handling can be changed for the current session:
 ```text
 /adaptive-5xx status
 /adaptive-5xx retry
+/adaptive-5xx retry-5m
 /adaptive-5xx fallback
 /adaptive-5xx toggle
 ```
 
-New sessions default to `retry`. `fallback` forwards a generic `502/503/504`
-after the first failed request so OMP can traverse its model fallback chain.
+New sessions default to `retry`. `retry-5m` keeps retrying the current provider
+with the staged backoff for at most five wall-clock minutes after the first
+generic `502/503/504`; recovery stays on the same provider, while expiry forwards
+the last error to OMP fallback. A retry still in flight at the deadline is aborted;
+once text, a tool call or an image starts, the deadline is removed so a healthy
+long response can finish. Pressing Esc during that window cancels the turn without
+starting fallback, including a deadline race. The fixed window is request-local, so selecting it
+turns shared retry off for the session and `/adaptive-share on` is rejected until
+another 5xx mode is selected. `fallback` forwards a generic `502/503/504` after
+the first failed request so OMP can traverse its model fallback chain.
 The choice is stored in the session, restored by `/resume`, and inherited by a
 fork whose active branch contains the policy entry. The status bar displays
 both choices, for example `5xx: retry 50x | shared: off`, so the effective
@@ -66,9 +75,15 @@ replace or migrate the root policy.
 
 The 5xx switch is intentionally narrow. Explicit concurrency/rate-limit or
 `server_is_overloaded` failures, even when accompanied by `502/503/504`, status-less transport failures and
-`stream_read_error` still use the selected local or shared retry campaign in both modes.
+`stream_read_error` still use the selected local or shared 50-attempt campaign in all modes.
+Their 50-attempt counter is separate from the five-minute generic-5xx window, so
+switching error classes does not make either policy expire early.
 Authentication, quota, billing and explicit model-unavailable failures still
-pass through immediately in both modes.
+pass through immediately in all modes.
+
+The policy is evaluated independently for each provider attempt in OMP's fallback
+chain. If a fallback provider also returns an ordinary `502/503/504`, it starts its
+own five-minute window; providers that fail for an immediate-fallback reason do not.
 
 Retry pacing is deliberately staged so a temporary provider limit does not
 turn into a rapid retry storm:
@@ -100,6 +115,11 @@ status is:
 TokenKing retry 2/50 [#-----------] transport
 ```
 
+During `retry-5m`, the same slot becomes a time-based progress bar, for example
+`AI Input retry 4 [#####-------] 5xx fallback in 3m12s`. It refreshes in place
+once per second during longer backoffs and in-flight probes and does not add transcript messages or
+consume model tokens.
+
 The bar and exact counter follow the request-local budget. Shared mode adds a
 queue position such as `q1/2`, meaning this window is first among two live
 tickets. The same status key is updated as the attempt or queue position changes and is cleared after substantive output,
@@ -123,8 +143,9 @@ cooldown behavior and diagnostic commands are recorded in
 |---|---|
 | Concurrency/rate-limit 429 before text/tool/image | Retry with the selected local/shared 50-attempt budget |
 | Generic upstream `502/503/504` in the default session mode | Retry with the selected local/shared 50-attempt budget |
+| Generic upstream `502/503/504` after `/adaptive-5xx retry-5m` | Retry the current provider for at most five minutes, then forward the last error to OMP fallback |
 | Generic upstream `502/503/504` after `/adaptive-5xx fallback` | Forward to OMP fallback after one request |
-| Explicit server overload | Retry with the selected local/shared 50-attempt budget in either 5xx mode |
+| Explicit server overload | Retry with the selected local/shared 50-attempt budget in every 5xx mode |
 | Stream/connection transport error before text/tool/image | Retry with the selected local/shared 50-attempt budget |
 | 429 quota, credits or billing exhausted | Forward to OMP fallback |
 | 401/403 authentication failure | Forward to OMP fallback |

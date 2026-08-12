@@ -70,6 +70,8 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			formatAdaptivePolicyStatus(mode, sharedRetryRecovery),
 		);
 	};
+	const effectiveSharedRetryRecovery = (mode: TransientUpstreamMode, sessionId: string | undefined) =>
+		mode === "retry-5m" ? false : sessionSharedRetryRecovery(sessionPolicies, sessionId);
 	const rehydrateSessionPolicy = (ctx: SessionContextLike) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (ctx.hasUI) retryStatuses.bindSession(sessionId, ctx.ui);
@@ -82,35 +84,49 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			lineageSessionId,
 			artifactsDir,
 		});
-		updateStatus(ctx, mode, sessionSharedRetryRecovery(sessionPolicies, sessionId));
+		updateStatus(ctx, mode, effectiveSharedRetryRecovery(mode, sessionId));
 	};
-	const streamOptions = (options: { sessionId?: string } | undefined) => ({
-		retryTransientUpstream5xx: sessionPolicyMode(sessionPolicies, options?.sessionId) === "retry",
-		sharedRetryRecovery: sessionSharedRetryRecovery(sessionPolicies, options?.sessionId),
-		onProgress: retryStatuses.createReporter(options?.sessionId),
-	});
+	const streamOptions = (options: { sessionId?: string } | undefined) => {
+		const mode = sessionPolicyMode(sessionPolicies, options?.sessionId);
+		return {
+			transientUpstream5xxMode: mode,
+			retryTransientUpstream5xx: mode !== "fallback",
+			sharedRetryRecovery: effectiveSharedRetryRecovery(mode, options?.sessionId),
+			onProgress: retryStatuses.createReporter(options?.sessionId),
+		};
+	};
 
 	pi.registerCommand("adaptive-5xx", {
-		description: "Choose whether generic 502/503/504 errors retry or immediately fall back in this session",
+		description: "Choose whether generic 502/503/504 errors retry 50x, retry for 5m, or immediately fall back",
 		handler: (args, ctx) => {
 			const sessionId = ctx.sessionManager.getSessionId();
 			const currentMode = sessionPolicyMode(sessionPolicies, sessionId);
 			const command = parseTransientUpstreamModeCommand(args, currentMode);
 			if (!command) {
-				ctx.ui.notify("Usage: /adaptive-5xx [status|retry|fallback|toggle]", "warning");
+				ctx.ui.notify("Usage: /adaptive-5xx [status|retry|retry-5m|fallback|toggle]", "warning");
 				return;
 			}
 			if (command !== "status") {
 				setSessionPolicy(sessionPolicies, sessionId, command);
 				pi.appendEntry(ADAPTIVE_5XX_POLICY_ENTRY, { mode: command });
+				if (command === "retry-5m" && sessionSharedRetryRecovery(sessionPolicies, sessionId)) {
+					setSessionSharedRetryRecovery(sessionPolicies, sessionId, false);
+					pi.appendEntry(ADAPTIVE_SHARE_POLICY_ENTRY, { enabled: false });
+					ctx.ui.notify(
+						"The 5-minute wall-clock window is request-local; shared retry was turned off for this session.",
+						"warning",
+					);
+				}
 			}
 			const mode = sessionPolicyMode(sessionPolicies, sessionId);
-			const sharedRetryRecovery = sessionSharedRetryRecovery(sessionPolicies, sessionId);
+			const sharedRetryRecovery = effectiveSharedRetryRecovery(mode, sessionId);
 			updateStatus(ctx, mode, sharedRetryRecovery);
 			ctx.ui.notify(
 				mode === "retry"
 					? `Generic 502/503/504 errors will use a ${sharedRetryRecovery ? "shared" : "local"} 50-attempt retry budget in this session.`
-					: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
+					: mode === "retry-5m"
+						? "Generic 502/503/504 errors will retry on the current provider for up to 5 minutes, then enter OMP fallback. Press Esc to cancel."
+						: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
 				"info",
 			);
 		},
@@ -119,18 +135,26 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 		description: "Choose whether retry recovery state is shared across OMP sessions",
 		handler: (args, ctx) => {
 			const sessionId = ctx.sessionManager.getSessionId();
-			const current = sessionSharedRetryRecovery(sessionPolicies, sessionId);
+			const mode = sessionPolicyMode(sessionPolicies, sessionId);
+			const current = effectiveSharedRetryRecovery(mode, sessionId);
 			const command = parseSharedRetryRecoveryCommand(args, current);
 			if (command === undefined) {
 				ctx.ui.notify("Usage: /adaptive-share [status|on|off|toggle]", "warning");
+				return;
+			}
+			if (mode === "retry-5m" && command === true) {
+				ctx.ui.notify(
+					"Shared retry cannot be enabled with retry-5m; choose /adaptive-5xx retry or fallback first.",
+					"warning",
+				);
 				return;
 			}
 			if (command !== "status") {
 				setSessionSharedRetryRecovery(sessionPolicies, sessionId, command);
 				pi.appendEntry(ADAPTIVE_SHARE_POLICY_ENTRY, { enabled: command });
 			}
-			const enabled = sessionSharedRetryRecovery(sessionPolicies, sessionId);
-			updateStatus(ctx, sessionPolicyMode(sessionPolicies, sessionId), enabled);
+			const enabled = effectiveSharedRetryRecovery(mode, sessionId);
+			updateStatus(ctx, mode, enabled);
 			ctx.ui.notify(
 				enabled
 					? "Retry recovery will share queue state across OMP sessions."
@@ -154,11 +178,11 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				maxRetries: 50,
 				...streamOptions(options),
 				createOutputStream: () => createAssistantMessageEventStream(),
-				createInputStream: () =>
+				createInputStream: attemptSignal =>
 					streamSimple(
 						toOpenAIResponsesModel(model),
 						context,
-						{ ...options, maxRetries: 0 },
+						{ ...options, signal: attemptSignal, maxRetries: 0 },
 					),
 				logger: pi.logger,
 			}),
@@ -261,7 +285,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 				maxRetries: 50,
 				...streamOptions(options),
 				createOutputStream: () => createAssistantMessageEventStream(),
-				createInputStream: () => {
+				createInputStream: attemptSignal => {
 					const canonicalModel = getModel("kimi-code", model.id);
 					if (!canonicalModel) {
 						throw new Error(`Missing canonical Kimi Code model: ${model.id}`);
@@ -269,7 +293,7 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 					return streamKimi(
 						kimiStreamModel(model, canonicalModel) as Parameters<typeof streamKimi>[0],
 						context,
-						kimiTransportOptions(options),
+						kimiTransportOptions({ ...options, signal: attemptSignal }),
 					);
 				},
 				logger: pi.logger,

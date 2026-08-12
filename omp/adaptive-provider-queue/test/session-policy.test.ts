@@ -30,10 +30,10 @@ test("the latest valid policy entry on the active branch is restored", () => {
 	const entries = [
 		{ type: "custom", customType: ADAPTIVE_5XX_POLICY_ENTRY, data: { mode: "fallback" } },
 		{ type: "message", message: { role: "user" } },
-		{ type: "custom", customType: ADAPTIVE_5XX_POLICY_ENTRY, data: { mode: "retry" } },
+		{ type: "custom", customType: ADAPTIVE_5XX_POLICY_ENTRY, data: { mode: "retry-5m" } },
 	];
 
-	assert.equal(transientUpstreamModeFromEntries(entries), "retry");
+	assert.equal(transientUpstreamModeFromEntries(entries), "retry-5m");
 });
 
 test("malformed and unrelated custom entries are ignored", () => {
@@ -75,9 +75,13 @@ test("the session command parses status, explicit modes and toggle", () => {
 	assert.equal(parseTransientUpstreamModeCommand("", "retry"), "status");
 	assert.equal(parseTransientUpstreamModeCommand(" STATUS ", "fallback"), "status");
 	assert.equal(parseTransientUpstreamModeCommand("retry", "fallback"), "retry");
+	assert.equal(parseTransientUpstreamModeCommand("retry-5m", "retry"), "retry-5m");
+	assert.equal(parseTransientUpstreamModeCommand("RETRY5M", "fallback"), "retry-5m");
+	assert.equal(parseTransientUpstreamModeCommand("5m", "retry"), "retry-5m");
 	assert.equal(parseTransientUpstreamModeCommand("FALLBACK", "retry"), "fallback");
 	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry"), "fallback");
 	assert.equal(parseTransientUpstreamModeCommand("toggle", "fallback"), "retry");
+	assert.equal(parseTransientUpstreamModeCommand("toggle", "retry-5m"), "retry");
 	assert.equal(parseTransientUpstreamModeCommand("unknown", "retry"), undefined);
 });
 
@@ -93,6 +97,7 @@ test("the shared recovery command parses status, explicit modes and toggle", () 
 
 test("the combined status reports both independent policies", () => {
 	assert.equal(formatAdaptivePolicyStatus("retry", false), "5xx: retry 50x | shared: off");
+	assert.equal(formatAdaptivePolicyStatus("retry-5m", false), "5xx: retry 5m -> fallback | shared: off");
 	assert.equal(formatAdaptivePolicyStatus("fallback", true), "5xx: immediate fallback | shared: on");
 });
 
