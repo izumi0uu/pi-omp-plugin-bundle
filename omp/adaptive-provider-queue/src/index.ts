@@ -1,47 +1,55 @@
 import {
 	createAssistantMessageEventStream,
-	getModel,
-	streamKimi,
+	isApiKeyResolver,
+	resolveApiKeyOnce,
+	seedApiKeyResolver,
 	streamSimple,
-	type Api,
+	type ApiKey,
 } from "@oh-my-pi/pi-ai";
+import { getProxyForUrl } from "@oh-my-pi/pi-ai/utils/proxy";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
-	KIMI_CODE_API,
-	KIMI_CODE_API_KEY,
-	KIMI_CODE_BASE_URL,
-	KIMI_MODEL_SPECS,
-	kimiStreamModel,
-	kimiTransportOptions,
-} from "./kimi-config.ts";
+	AIINPUT_ENDPOINTS,
+	AIINPUT_PROVIDER,
+	AiInputEndpointRouter,
+	formatAiInputRouteStatus,
+	resolveAiInputEndpoint,
+} from "./aiinput-router.ts";
 import { AdaptiveProviderQueue } from "./queue.ts";
-import { toOpenAIResponsesModel } from "./responses-model.ts";
 import { sharedRetryStatusController } from "./retry-progress.ts";
 import {
 	ADAPTIVE_5XX_POLICY_ENTRY,
+	ADAPTIVE_AIINPUT_ROUTE_POLICY_ENTRY,
 	ADAPTIVE_SHARE_POLICY_ENTRY,
 	formatAdaptivePolicyStatus,
 	formatTransientUpstreamModeList,
 	modeForcesIsolatedRetry,
+	parseAiInputRouteCommand,
 	parseSharedRetryRecoveryCommand,
 	parseTransientUpstreamModeCommand,
+	providerRequestAiInputRoutePolicy,
 	restoreSessionPolicy,
+	sessionAiInputRoutePolicy,
 	sessionPolicyMode,
 	sessionSharedRetryRecovery,
+	setSessionAiInputRoutePolicy,
 	setSessionPolicy,
 	setSessionSharedRetryRecovery,
 	sharedSessionPolicyStore,
+	type SessionAiInputRoutePolicy,
 	type TransientUpstreamMode,
 } from "./session-policy.ts";
-import { createAdaptiveStream } from "./stream-wrapper.ts";
-
-const QUEUED_RESPONSES_API = "adaptive-queued-openai-responses" as Api;
-const KIMI_MODELS = KIMI_MODEL_SPECS.map(model => ({
-	...model,
-	api: KIMI_CODE_API as Api,
-	baseUrl: KIMI_CODE_BASE_URL,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-}));
+import {
+	createAdaptiveStream,
+	isAdaptiveTransientTransport,
+	isAdaptiveTransientUpstream,
+} from "./stream-wrapper.ts";
+import {
+	ADAPTIVE_RETRY_API,
+	modelRequestOptions,
+	UniversalProviderRetry,
+	type ModelRegistryLike,
+} from "./universal-provider.ts";
 
 const queue = new AdaptiveProviderQueue({
 	baseDelayMs: 500,
@@ -54,13 +62,22 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	type SessionContextLike = {
 		hasUI: boolean;
 		ui: { setStatus(key: string, text: string | undefined): void };
+		modelRegistry: ModelRegistryLike & {
+			resolver?(model: unknown, sessionId?: string): unknown | Promise<unknown>;
+		};
 		localProtocolOptions?: { getSessionId?(): string | null };
 		sessionManager: {
 			getArtifactsDir(): string | null;
 			getBranch(): unknown[];
+			getEntries(): unknown[];
 			getSessionId(): string;
 		};
 	};
+	const universalRetry = new UniversalProviderRetry();
+	const aiInputRouter = new AiInputEndpointRouter({
+		logger: pi.logger,
+		proxyForUrl: url => getProxyForUrl(AIINPUT_PROVIDER, url),
+	});
 	const updateStatus = (
 		ctx: SessionContextLike,
 		mode: TransientUpstreamMode,
@@ -74,7 +91,25 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	};
 	const effectiveSharedRetryRecovery = (mode: TransientUpstreamMode, sessionId: string | undefined) =>
 		modeForcesIsolatedRetry(mode) ? false : sessionSharedRetryRecovery(sessionPolicies, sessionId);
-	const rehydrateSessionPolicy = (ctx: SessionContextLike) => {
+	const updateAiInputRouteStatus = (ctx: SessionContextLike, policy: SessionAiInputRoutePolicy) => {
+		if (!ctx.hasUI) return;
+		ctx.ui.setStatus(
+			"adaptive-provider-queue:aiinput-route",
+			policy.mode === "pinned"
+				? `AI Input: pinned ${policy.endpointId}`
+				: undefined,
+		);
+	};
+	const formatSessionAiInputRouteStatus = async (sessionId: string): Promise<string> => {
+		const policy = sessionAiInputRoutePolicy(sessionPolicies, sessionId);
+		const endpoint = policy.mode === "pinned" ? resolveAiInputEndpoint(policy.endpointId) : undefined;
+		return formatAiInputRouteStatus(await aiInputRouter.snapshot(), {
+			pinnedBaseUrl: endpoint?.baseUrl,
+			pinExpiresAt: policy.mode === "pinned" ? policy.expiresAt : undefined,
+		});
+	};
+	const prepareSession = (ctx: SessionContextLike) => {
+		universalRetry.wrapRegistry(ctx.modelRegistry);
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (ctx.hasUI) retryStatuses.bindSession(sessionId, ctx.ui);
 		const lineageSessionId = ctx.localProtocolOptions?.getSessionId?.() ?? undefined;
@@ -82,11 +117,17 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 		const mode = restoreSessionPolicy(sessionPolicies, {
 			sessionId,
 			entries: ctx.sessionManager.getBranch(),
+			routeEntries: ctx.sessionManager.getEntries(),
 			hasUI: ctx.hasUI,
 			lineageSessionId,
 			artifactsDir,
 		});
 		updateStatus(ctx, mode, effectiveSharedRetryRecovery(mode, sessionId));
+		updateAiInputRouteStatus(ctx, sessionAiInputRoutePolicy(sessionPolicies, sessionId));
+	};
+	const refreshWrappedModels = (ctx: SessionContextLike) => {
+		universalRetry.wrapRegistry(ctx.modelRegistry);
+		updateAiInputRouteStatus(ctx, sessionAiInputRoutePolicy(sessionPolicies, ctx.sessionManager.getSessionId()));
 	};
 	const streamOptions = (options: { sessionId?: string } | undefined) => {
 		const mode = sessionPolicyMode(sessionPolicies, options?.sessionId);
@@ -96,6 +137,19 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			sharedRetryRecovery: effectiveSharedRetryRecovery(mode, options?.sessionId),
 			onProgress: retryStatuses.createReporter(options?.sessionId),
 		};
+	};
+	const resolveAiInputApiKey = async (ctx: SessionContextLike): Promise<unknown> => {
+		const model = ctx.modelRegistry.getAll().find(value => {
+			if (!value || typeof value !== "object") return false;
+			return (value as { provider?: unknown }).provider === AIINPUT_PROVIDER;
+		});
+		if (!model || !ctx.modelRegistry.resolver) return undefined;
+		const credential = await Promise.resolve(
+			ctx.modelRegistry.resolver(model, ctx.sessionManager.getSessionId()),
+		);
+		return await resolveApiKeyOnce(
+			credential as Parameters<typeof resolveApiKeyOnce>[0],
+		);
 	};
 
 	pi.registerCommand("adaptive-5xx", {
@@ -133,9 +187,9 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 					? `Managed provider errors will use a ${sharedRetryRecovery ? "shared" : "local"} 50-retry budget, then enter OMP fallback.`
 					: mode === "retry-stop"
 						? "Managed provider errors will retry up to 50 times, then stop this turn without OMP fallback."
-					: mode === "retry-5m"
-						? "Generic 502/503/504 errors will retry on the current provider for up to 5 minutes, then enter OMP fallback. Press Esc to cancel."
-						: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
+						: mode === "retry-5m"
+							? "Generic 502/503/504 errors will retry on the current provider for up to 5 minutes, then enter OMP fallback. Press Esc to cancel."
+							: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
 				"info",
 			);
 		},
@@ -172,141 +226,127 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			);
 		},
 	});
-	pi.on("session_start", (_event, ctx) => rehydrateSessionPolicy(ctx));
-	pi.on("session_switch", (_event, ctx) => rehydrateSessionPolicy(ctx));
-	pi.on("session_branch", (_event, ctx) => rehydrateSessionPolicy(ctx));
-	pi.on("session_tree", (_event, ctx) => rehydrateSessionPolicy(ctx));
+	pi.registerCommand("aiinput-route", {
+		description: "Inspect, refresh, or pin AI Input routing for this session",
+		handler: async (args, ctx) => {
+			const sessionId = ctx.sessionManager.getSessionId();
+			const command = parseAiInputRouteCommand(args);
+			try {
+				if (!command) {
+					ctx.ui.notify("Usage: /aiinput-route [status|refresh|auto|pin <ai|eo|input> [duration]]", "warning");
+					return;
+				}
+				if (command.action === "status") {
+					const policy = sessionAiInputRoutePolicy(sessionPolicies, sessionId);
+					updateAiInputRouteStatus(ctx as SessionContextLike, policy);
+					ctx.ui.notify(await formatSessionAiInputRouteStatus(sessionId), "info");
+					return;
+				}
+				if (command.action === "refresh") {
+					const apiKey = await resolveAiInputApiKey(ctx as SessionContextLike);
+					await aiInputRouter.selectEndpoint({ apiKey, forceRefresh: true });
+					ctx.ui.notify(await formatSessionAiInputRouteStatus(sessionId), "info");
+					return;
+				}
+				if (command.action === "auto") {
+					const policy = { mode: "auto" } as const;
+					setSessionAiInputRoutePolicy(sessionPolicies, sessionId, policy);
+					pi.appendEntry(ADAPTIVE_AIINPUT_ROUTE_POLICY_ENTRY, { ...policy, sessionId });
+					updateAiInputRouteStatus(ctx as SessionContextLike, policy);
+					ctx.ui.notify(
+						`AI Input routing is automatic in this OMP session.\n${await formatSessionAiInputRouteStatus(sessionId)}`,
+						"info",
+					);
+					return;
+				}
+				if (command.action === "pin") {
+					const policy: SessionAiInputRoutePolicy = {
+						mode: "pinned",
+						endpointId: command.endpointId,
+						...(command.expiresAt === undefined ? {} : { expiresAt: command.expiresAt }),
+					};
+					setSessionAiInputRoutePolicy(sessionPolicies, sessionId, policy);
+					pi.appendEntry(ADAPTIVE_AIINPUT_ROUTE_POLICY_ENTRY, { ...policy, sessionId });
+					updateAiInputRouteStatus(ctx as SessionContextLike, policy);
+					const endpoint = resolveAiInputEndpoint(command.endpointId);
+					if (endpoint) {
+						await aiInputRouter.selectEndpoint({ pinnedBaseUrl: endpoint.baseUrl });
+					}
+					const duration = command.expiresAt === undefined ? "until changed" : "until its timer expires";
+					ctx.ui.notify(
+						`Pinned ${endpoint ? new URL(endpoint.baseUrl).hostname : command.endpointId} for this OMP session ${duration}.\n${await formatSessionAiInputRouteStatus(sessionId)}`,
+						"info",
+					);
+					return;
+				}
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+	pi.on("session_start", (_event, ctx) => prepareSession(ctx));
+	pi.on("session_switch", (_event, ctx) => prepareSession(ctx));
+	pi.on("session_branch", (_event, ctx) => prepareSession(ctx));
+	pi.on("session_tree", (_event, ctx) => prepareSession(ctx));
+	pi.on("model_select", (_event, ctx) => refreshWrappedModels(ctx));
+	pi.on("before_provider_request", (_event, ctx) => refreshWrappedModels(ctx));
+	pi.on("session_shutdown", () => aiInputRouter.stop());
 
 	pi.registerProvider("adaptive-provider-queue", {
-		api: QUEUED_RESPONSES_API,
-		streamSimple: (model, context, options) =>
-			createAdaptiveStream({
+		api: ADAPTIVE_RETRY_API,
+		streamSimple: (model, context, options) => {
+			const requestApiKey = options?.apiKey as ApiKey | undefined;
+			const aiInputCredential = model.provider === AIINPUT_PROVIDER
+				? Promise.resolve().then(async () => {
+					const resolvedKey = await resolveApiKeyOnce(requestApiKey, options?.signal);
+					return {
+						resolvedKey,
+						downstreamKey: isApiKeyResolver(requestApiKey)
+							? seedApiKeyResolver(resolvedKey, requestApiKey)
+							: requestApiKey,
+					};
+				})
+				: undefined;
+			return createAdaptiveStream({
 				model,
 				requestOptions: options,
 				queue,
+				laneScope: model.provider === AIINPUT_PROVIDER ? "aiinput-account" : undefined,
+				resolveLaneApiKey: aiInputCredential
+					? async () => (await aiInputCredential).resolvedKey
+					: undefined,
 				maxRetries: 50,
+				rotateEndpointOnError: error =>
+					isAdaptiveTransientTransport(error) || isAdaptiveTransientUpstream(error),
+				endpointPoolSize: model.provider === AIINPUT_PROVIDER ? AIINPUT_ENDPOINTS.length : undefined,
 				...streamOptions(options),
 				createOutputStream: () => createAssistantMessageEventStream(),
-				createInputStream: attemptSignal =>
-					streamSimple(
-						toOpenAIResponsesModel(model),
+				createInputStream: async (attemptSignal, attempt) => {
+					const restoredModel = universalRetry.restoreOriginalModel(model);
+					const credential = await aiInputCredential;
+					const routePolicy = providerRequestAiInputRoutePolicy(sessionPolicies, {
+						sessionId: options?.sessionId,
+						providerSessionState: options?.providerSessionState,
+					});
+					const pinnedEndpoint = routePolicy.mode === "pinned"
+						? resolveAiInputEndpoint(routePolicy.endpointId)
+						: undefined;
+					const routed = await aiInputRouter.routeModel(restoredModel, {
+						apiKey: credential?.resolvedKey,
+						signal: attemptSignal,
+						exclude: attempt?.excludeBaseUrls,
+						pinnedBaseUrl: pinnedEndpoint?.baseUrl,
+					});
+					attempt?.setBaseUrl(routed.baseUrl);
+					const upstreamOptions = modelRequestOptions(routed.model, options);
+					return streamSimple(
+						routed.model,
 						context,
-						{ ...options, signal: attemptSignal, maxRetries: 0 },
-					),
-				logger: pi.logger,
-			}),
-	});
-
-	pi.registerProvider("aiinput-queued", {
-		baseUrl: "https://ai.input.im/v1",
-		apiKey: "AIINPUT_API_KEY",
-		api: QUEUED_RESPONSES_API,
-		models: [
-			{
-				id: "gpt-5.6-sol",
-				name: "GPT 5.6 Sol (AI Input, adaptive queue)",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 372_000,
-				maxTokens: 32_768,
-			},
-		],
-	});
-
-	pi.registerProvider("aiinput-overseas-queued", {
-		baseUrl: "https://input.codes/v1",
-		apiKey: "AIINPUT_API_KEY",
-		api: QUEUED_RESPONSES_API,
-		models: [
-			{
-				id: "gpt-5.6-sol",
-				name: "GPT 5.6 Sol (AI Input overseas, adaptive queue)",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 372_000,
-				maxTokens: 32_768,
-			},
-		],
-	});
-
-	pi.registerProvider("aiinput2-overseas-queued", {
-		baseUrl: "https://input.codes/v1",
-		apiKey: "AIINPUT2_API_KEY",
-		api: QUEUED_RESPONSES_API,
-		models: [
-			{
-				id: "gpt-5.6-sol",
-				name: "GPT 5.6 Sol (AI Input 2 overseas, adaptive queue)",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 372_000,
-				maxTokens: 32_768,
-			},
-		],
-	});
-
-	pi.registerProvider("tokenking-queued", {
-		baseUrl: "https://api.tokenskingdom.com/v1",
-		apiKey: "TOKENKING_API_KEY",
-		api: QUEUED_RESPONSES_API,
-		models: [
-			{
-				id: "gpt-5.6-sol",
-				name: "GPT 5.6 Sol (TokenKing, adaptive queue)",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 372_000,
-				maxTokens: 32_768,
-			},
-		],
-	});
-
-	pi.registerProvider("tokenking-grok-queued", {
-		baseUrl: "https://api.tokenskingdom.com/v1",
-		apiKey: "TOKENKING_GROK_API_KEY",
-		api: QUEUED_RESPONSES_API,
-		models: [
-			{
-				id: "grok-4.5",
-				name: "Grok 4.5 (TokenKing, adaptive queue)",
-				reasoning: true,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 256_000,
-				maxTokens: 32_768,
-			},
-		],
-	});
-
-	pi.registerProvider("kimi-code-queued", {
-		baseUrl: KIMI_CODE_BASE_URL,
-		apiKey: KIMI_CODE_API_KEY,
-		api: KIMI_CODE_API as Api,
-		streamSimple: (model, context, options) =>
-			createAdaptiveStream({
-				model,
-				requestOptions: options,
-				queue,
-				maxRetries: 50,
-				...streamOptions(options),
-				createOutputStream: () => createAssistantMessageEventStream(),
-				createInputStream: attemptSignal => {
-					const canonicalModel = getModel("kimi-code", model.id);
-					if (!canonicalModel) {
-						throw new Error(`Missing canonical Kimi Code model: ${model.id}`);
-					}
-					return streamKimi(
-						kimiStreamModel(model, canonicalModel) as Parameters<typeof streamKimi>[0],
-						context,
-						kimiTransportOptions({ ...options, signal: attemptSignal }),
+						{ ...upstreamOptions, apiKey: credential?.downstreamKey ?? requestApiKey, signal: attemptSignal, maxRetries: 0 },
 					);
 				},
 				logger: pi.logger,
-			}),
-		models: KIMI_MODELS,
+			});
+		},
 	});
 }

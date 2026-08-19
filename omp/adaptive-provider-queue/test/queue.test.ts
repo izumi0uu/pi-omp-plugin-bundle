@@ -5,12 +5,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, test } from "node:test";
 import {
+	AIINPUT_ENDPOINTS,
+	AiInputEndpointRouter,
+} from "../src/aiinput-router.ts";
+import {
 	AdaptiveProviderQueue,
 	createLaneId,
 	sleepWithSignal,
 	type LaneRetryState,
 } from "../src/queue.ts";
-import { toOpenAIResponsesModel } from "../src/responses-model.ts";
 import type { AdaptiveRetryProgress } from "../src/retry-progress.ts";
 import {
 	AdaptiveRetryExhaustedError,
@@ -51,6 +54,29 @@ test("lane identity shares an endpoint only when the credential also matches", (
 	assert.notEqual(first, otherAccount);
 });
 
+test("an explicit logical lane shares one provider account across routed endpoints", () => {
+	const main = createLaneId({
+		provider: "aiinput",
+		baseUrl: "https://ai.input.im/v1",
+		laneScope: "aiinput-account",
+		apiKey: "same",
+	});
+	const edge = createLaneId({
+		provider: "aiinput",
+		baseUrl: "https://eo.input.codes/v1",
+		laneScope: "aiinput-account",
+		apiKey: "same",
+	});
+	const otherAccount = createLaneId({
+		provider: "aiinput",
+		baseUrl: "https://eo.input.codes/v1",
+		laneScope: "aiinput-account",
+		apiKey: "different",
+	});
+	assert.equal(main, edge);
+	assert.notEqual(main, otherAccount);
+});
+
 test("transient concurrency limits remain distinct from provider-account failures", () => {
 	assert.equal(
 		isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "rate_limit_exceeded: Concurrency limit exceeded for account" }),
@@ -60,6 +86,7 @@ test("transient concurrency limits remain distinct from provider-account failure
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 429, errorMessage: "" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorMessage: "Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorMessage: "Error Code server_error: Our servers are currently overloaded. Please try again later." }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 500, errorMessage: "Error Code server_error: Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 502, errorMessage: "server_is_overloaded" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 504, errorMessage: "server_is_overloaded" }), true);
@@ -131,6 +158,10 @@ test("authentication, quota, billing and explicit model failures enter the provi
 test("transport and generic upstream errors use distinct adaptive retry classes", () => {
 	assert.equal(isAdaptiveTransientTransport({ errorMessage: "Error Code stream_read_error: stream_read_error" }), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("socket connection was closed unexpectedly")), true);
+	assert.equal(
+		isAdaptiveTransientTransport(new Error("Unable to connect. Is the computer able to access the url?")),
+		true,
+	);
 	assert.equal(isAdaptiveTransientTransport(new Error("OpenAI responses stream timed out while waiting for the first event")), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("responses stream ended without response.completed: missing_terminal")), true);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "Bad gateway" }), false);
@@ -174,32 +205,6 @@ test("retry backoff uses ten-attempt stages and caps every wait at five minutes"
 	for (const [attempt, delay] of expected) assert.equal(queue.backoffDelayMs(attempt), delay);
 	assert.equal(queue.backoffDelayMs(1, 900_000), 300_000);
 	assert.equal(new AdaptiveProviderQueue({ baseDelayMs: 2_000, maxDelayMs: 300_000, random: () => 1 }).backoffDelayMs(41), 300_000);
-});
-
-test("queued custom models regain Responses compat without downgrading reasoning effort", () => {
-	const source = {
-		provider: "aiinput-queued",
-		id: "gpt-5.6-sol",
-		name: "GPT 5.6 Sol",
-		reasoning: true,
-		compat: undefined,
-	};
-	const gpt = toOpenAIResponsesModel(source);
-	assert.equal(gpt.api, "openai-responses");
-	assert.equal(gpt.compat.supportsReasoningEffort, true);
-	assert.equal(gpt.compat.omitReasoningEffort, false);
-	assert.equal(gpt.compat.supportsSamplingParams, false);
-	assert.equal(source.compat, undefined);
-
-	const grok = toOpenAIResponsesModel({
-		provider: "tokenking-grok-queued",
-		id: "grok-4.5",
-		name: "Grok 4.5",
-		reasoning: true,
-		compatConfig: { supportsStrictMode: true },
-	});
-	assert.equal(grok.compat.supportsSamplingParams, true);
-	assert.equal(grok.compat.supportsStrictMode, true);
 });
 
 test("tickets are ordered across queue instances and the next waiter wakes after release", async () => {
@@ -676,6 +681,154 @@ function assistant(overrides: Record<string, unknown> = {}) {
 	return { stopReason: "error", content: [], ...overrides };
 }
 
+const ROUTED_AIINPUT_ENDPOINTS = AIINPUT_ENDPOINTS.map(endpoint => endpoint.baseUrl);
+
+interface RoutedRetryObservation {
+	attempt: number;
+	baseUrl: string;
+	excluded: string[];
+}
+
+interface RoutedRetryRun {
+	observations: RoutedRetryObservation[];
+	rankedBaseUrls: string[];
+}
+
+type RoutedFailure =
+	| { kind: "event"; error: unknown }
+	| { kind: "throw"; error: unknown };
+
+async function runRoutedRetry(
+	failures: readonly RoutedFailure[],
+	pinnedBaseUrl?: string,
+): Promise<RoutedRetryRun> {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0, random: () => 0 });
+	const router = new AiInputEndpointRouter({
+		stateDir: path.join(rootDir, "router"),
+		probeIntervalMs: 60_000,
+		proxyUrl: "",
+		fetchImpl: async input => {
+			const baseUrl = String(input).replace(/\/models$/, "");
+			const index = ROUTED_AIINPUT_ENDPOINTS.indexOf(baseUrl as (typeof ROUTED_AIINPUT_ENDPOINTS)[number]);
+			await sleepWithSignal((index + 1) * 5);
+			return new Response();
+		},
+	});
+	await router.selectEndpoint({ apiKey: "test-key", forceRefresh: true });
+	const rankedBaseUrls = (await router.snapshot()).endpoints
+		.filter(endpoint => endpoint.score !== undefined)
+		.sort((left, right) => (left.score ?? Infinity) - (right.score ?? Infinity))
+		.map(endpoint => endpoint.baseUrl);
+	assert.equal(rankedBaseUrls.length, ROUTED_AIINPUT_ENDPOINTS.length);
+	const observations: RoutedRetryObservation[] = [];
+	let requestCount = 0;
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "ok" }] });
+	const output = createAdaptiveStream({
+		model: {
+			provider: "aiinput",
+			id: "gpt-5.6-sol",
+			baseUrl: ROUTED_AIINPUT_ENDPOINTS[0],
+		},
+		requestOptions: { apiKey: "test-key" },
+		queue,
+		maxRetries: failures.length,
+		endpointPoolSize: ROUTED_AIINPUT_ENDPOINTS.length,
+		rotateEndpointOnError: error => isAdaptiveTransientTransport(error) || isAdaptiveTransientUpstream(error),
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: async (_signal, context) => {
+			if (!context) throw new Error("adaptive attempt context was not provided");
+			const excluded = [...context.excludeBaseUrls];
+			const routed = await router.routeModel(
+				{ provider: "aiinput", id: "gpt-5.6-sol", baseUrl: ROUTED_AIINPUT_ENDPOINTS[0] },
+				{ apiKey: "test-key", exclude: context.excludeBaseUrls, pinnedBaseUrl },
+			);
+			if (!routed.baseUrl) throw new Error("AI Input router did not select a base URL");
+			const baseUrl = routed.baseUrl;
+			context.setBaseUrl(baseUrl);
+			observations.push({ attempt: context.number, baseUrl, excluded });
+			const failure = failures[requestCount++];
+			if (failure?.kind === "throw") throw failure.error;
+			if (failure?.kind === "event") {
+				return new FakeInputStream([{ type: "error", reason: "error", error: failure.error }]);
+			}
+			return new FakeInputStream([
+				{ type: "start", partial: succeeded },
+				{ type: "text_delta", contentIndex: 0, delta: "ok", partial: succeeded },
+				{ type: "done", reason: "stop", message: succeeded },
+			]);
+		},
+	});
+
+	try {
+		await output.completion.promise;
+		assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+		return { observations, rankedBaseUrls };
+	} finally {
+		router.stop();
+	}
+}
+
+test("transport and generic 502/503/504 failures exclude the current URL before retrying", async () => {
+	for (const failure of [
+		{ kind: "event", error: new Error("socket connection was closed unexpectedly") },
+		{ kind: "event", error: assistant({ errorStatus: 502, errorMessage: "Bad gateway" }) },
+		{ kind: "event", error: assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }) },
+		{ kind: "throw", error: assistant({ errorStatus: 504, errorMessage: "Gateway timeout" }) },
+		{ kind: "throw", error: new Error("fetch failed: ECONNRESET") },
+	] satisfies readonly RoutedFailure[]) {
+		const { observations, rankedBaseUrls } = await runRoutedRetry([failure]);
+		assert.equal(observations.length, 2);
+		assert.equal(observations[0].baseUrl, rankedBaseUrls[0]);
+		assert.deepEqual(observations[0].excluded, []);
+		assert.equal(observations[1].baseUrl, rankedBaseUrls[1]);
+		assert.deepEqual(observations[1].excluded, [rankedBaseUrls[0]]);
+	}
+});
+
+test("429 authentication and quota failures stay on the current URL", async () => {
+	const { observations, rankedBaseUrls } = await runRoutedRetry([
+		{ kind: "event", error: assistant({ errorStatus: 429, errorMessage: "Concurrency limit exceeded for account" }) },
+		{ kind: "throw", error: assistant({ errorStatus: 401, errorMessage: "OAuth access token has been revoked" }) },
+		{ kind: "event", error: assistant({ errorStatus: 402, errorMessage: "billing balance exhausted" }) },
+	]);
+	assert.equal(observations.length, 4);
+	assert.deepEqual(observations.map(observation => observation.baseUrl), Array(4).fill(rankedBaseUrls[0]));
+	assert.ok(observations.every(observation => observation.excluded.length === 0));
+});
+
+test("a session pin keeps Retry on one URL even after transport and upstream exclusions", async () => {
+	const pinnedBaseUrl = ROUTED_AIINPUT_ENDPOINTS[1];
+	const { observations } = await runRoutedRetry([
+		{ kind: "event", error: new Error("socket connection was closed unexpectedly") },
+		{ kind: "event", error: assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }) },
+	], pinnedBaseUrl);
+	assert.deepEqual(observations.map(observation => observation.baseUrl), Array(3).fill(pinnedBaseUrl));
+	assert.deepEqual(observations.map(observation => observation.excluded), [
+		[],
+		[pinnedBaseUrl],
+		[pinnedBaseUrl],
+	]);
+});
+
+test("excluding all three URLs resets the request-local endpoint cycle", async () => {
+	const { observations, rankedBaseUrls } = await runRoutedRetry([
+		{ kind: "event", error: assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }) },
+		{ kind: "event", error: assistant({ errorStatus: 502, errorMessage: "Bad gateway" }) },
+		{ kind: "event", error: assistant({ errorStatus: 504, errorMessage: "Gateway timeout" }) },
+	]);
+	assert.deepEqual(observations.map(observation => observation.baseUrl), [
+		...rankedBaseUrls,
+		rankedBaseUrls[0],
+	]);
+	assert.deepEqual(observations.map(observation => observation.excluded), [
+		[],
+		[rankedBaseUrls[0]],
+		[rankedBaseUrls[0], rankedBaseUrls[1]],
+		[],
+	]);
+});
+
 function rejectSharedRetryCalls(queue: AdaptiveProviderQueue): string[] {
 	const calls: string[] = [];
 	const methods = [
@@ -922,6 +1075,31 @@ test("retry-stop also suppresses fallback when a retryable failure is thrown", a
 	assert.equal(output.events[0].reason, "aborted");
 	assert.equal(output.events[0].error.errorMessage, adaptiveRetryStopMessage(1));
 	assert.equal(output.events[0].error.stopReason, "aborted");
+});
+
+test("retry-stop retries OMP's normalized unable-to-connect stream error", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = assistant({ errorMessage: "Unable to connect. Is the computer able to access the url?" });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "primary", id: "model", api: "openai-responses", baseUrl: "https://example.test/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		transientUpstream5xxMode: "retry-stop",
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			return new FakeInputStream([{ type: "error", reason: "error", error: failed }]);
+		},
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts, 2);
+	assert.equal(output.events.length, 1);
+	assert.equal(output.events[0].reason, "aborted");
+	assert.equal(output.events[0].error.errorMessage, adaptiveRetryStopMessage(1));
 });
 
 test("retry-stop never replays or sanitizes a thrown failure that already contains substantive output", async () => {

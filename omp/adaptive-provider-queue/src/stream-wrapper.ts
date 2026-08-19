@@ -76,6 +76,8 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	model: { provider: string; id?: string; baseUrl?: string; [key: string]: unknown };
 	requestOptions?: { apiKey?: unknown; signal?: AbortSignal; [key: string]: unknown };
 	queue: AdaptiveProviderQueue;
+	laneScope?: string;
+	resolveLaneApiKey?(): Promise<unknown>;
 	maxRetries?: number;
 	transientUpstream5xxMode?: TransientUpstreamMode;
 	upstream5xxRetryWindowMs?: number;
@@ -83,12 +85,20 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	retryTransientUpstream5xx?: boolean;
 	sharedRetryRecovery?: boolean;
 	createOutputStream(): TOutput;
-	createInputStream(signal?: AbortSignal): InputStreamLike;
+	createInputStream(signal?: AbortSignal, attempt?: AdaptiveAttemptContext): InputStreamLike | Promise<InputStreamLike>;
+	rotateEndpointOnError?(error: unknown): boolean;
+	endpointPoolSize?: number;
 	logger?: QueueLogger;
 	onProgress?(progress: AdaptiveRetryProgress | undefined): void;
 	now?(): number;
 	sleep?(ms: number, signal?: AbortSignal): Promise<void>;
 	scheduleTimeout?(callback: () => void, delayMs: number): ScheduledTimeoutCleanup;
+}
+
+export interface AdaptiveAttemptContext {
+	readonly number: number;
+	readonly excludeBaseUrls: ReadonlySet<string>;
+	setBaseUrl(baseUrl: string | undefined): void;
 }
 
 export const DEFAULT_MAX_RETRIES = 50;
@@ -120,6 +130,7 @@ const AUTHENTICATION_HTTP_STATUS_PATTERN =
 	/(?:^|\b(?:http(?:[_ -]*error|[_ -]+status)?|status(?:[_ -]+code)?|error(?:[_ -]+code)?)[_ :=(-]+)(?:401|402|403)\b/i;
 const TRANSIENT_SERVER_OVERLOAD_PATTERN =
 	/server[_ -]?is[_ -]?overloaded|servers? (?:are )?(?:currently )?overloaded|server overload(?:ed)?/i;
+const TRANSIENT_SERVER_OVERLOAD_STATUSES = new Set([429, 500, 502, 503, 504]);
 const TRANSIENT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit(?:ed| exceeded)?|retry (?:again )?later/i;
 const EXPLICIT_RATE_LIMIT_PATTERN =
@@ -127,7 +138,7 @@ const EXPLICIT_RATE_LIMIT_PATTERN =
 const EXPLICIT_TRANSIENT_TRANSPORT_PATTERN =
 	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
 const TRANSIENT_TRANSPORT_PATTERN =
-	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
+	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|unable to connect|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
 const TRANSIENT_UPSTREAM_STATUSES = new Set([502, 503, 504]);
 
 function errorText(error: unknown): string {
@@ -176,7 +187,7 @@ export function isAdaptiveRateLimit(error: unknown): boolean {
 	if (isAdaptiveProviderFailure(error)) return false;
 	const status = errorStatus(error);
 	if (TRANSIENT_SERVER_OVERLOAD_PATTERN.test(text)) {
-		return status === undefined || status === 429 || TRANSIENT_UPSTREAM_STATUSES.has(status);
+		return status === undefined || TRANSIENT_SERVER_OVERLOAD_STATUSES.has(status);
 	}
 	if (EXPLICIT_RATE_LIMIT_PATTERN.test(text)) {
 		return status === undefined || status === 429 || TRANSIENT_UPSTREAM_STATUSES.has(status);
@@ -411,12 +422,6 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 			? false
 			: (options.sharedRetryRecovery ?? false);
 	const stopAfterRetryExhaustion = transientUpstream5xxMode === "retry-stop";
-	const laneId = createLaneId({
-		provider: options.model.provider,
-		baseUrl: options.model.baseUrl,
-		apiKey: options.requestOptions?.apiKey,
-	});
-
 	void (async () => {
 		let ticket: QueueTicket | undefined;
 		let bypassedRetryState: LaneRetryState | undefined;
@@ -430,6 +435,8 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 		let nextAttemptUsesTransientUpstreamDeadline = false;
 		let lastTransientUpstreamFailure: TransientUpstreamFailure | undefined;
 		let lastRetryableFailure: AssistantLike | undefined;
+		let attemptNumber = 0;
+		const excludedBaseUrls = new Set<string>();
 		let progressAttempt = 0;
 		let progressMaxRetries = maxRetries;
 		let progressKind: RetryProgressKind | undefined;
@@ -491,6 +498,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 			}
 		};
 		try {
+			const laneApiKey = options.resolveLaneApiKey
+				? await options.resolveLaneApiKey()
+				: options.requestOptions?.apiKey;
+			const laneId = createLaneId({
+				provider: options.model.provider,
+				baseUrl: options.model.baseUrl,
+				laneScope: options.laneScope,
+				apiKey: laneApiKey,
+			});
 			const [hasWaiters, retryState] = sharedRetryRecovery
 				? await Promise.all([options.queue.hasWaiters(laneId), options.queue.getRetryState(laneId)])
 				: [false, undefined] as const;
@@ -782,6 +798,13 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					requestCountdown = undefined;
 					attemptGuard?.disableDeadline();
 				};
+				let attemptBaseUrl: string | undefined;
+				const excludeAttemptEndpoint = (error: unknown) => {
+					if (!attemptBaseUrl || !options.rotateEndpointOnError?.(error)) return;
+					excludedBaseUrls.add(attemptBaseUrl);
+					const poolSize = Math.max(0, Math.floor(options.endpointPoolSize ?? 0));
+					if (poolSize > 0 && excludedBaseUrls.size >= poolSize) excludedBaseUrls.clear();
+				};
 				const forwardLastTransientUpstreamFailure = async () => {
 					if (signal?.aborted) throw cancellationError();
 					const failure = lastTransientUpstreamFailure;
@@ -827,7 +850,19 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						requestCountdown = setInterval(() => publishProgress("requesting"), 1_000);
 						requestCountdown.unref?.();
 					}
-					const input = options.createInputStream(attemptGuard?.signal ?? signal);
+					const attemptContext: AdaptiveAttemptContext = {
+						number: ++attemptNumber,
+						excludeBaseUrls: excludedBaseUrls,
+						setBaseUrl: value => {
+							attemptBaseUrl = value;
+						},
+					};
+					const inputPromise = Promise.resolve(
+						options.createInputStream(attemptGuard?.signal ?? signal, attemptContext),
+					);
+					const input = attemptGuard
+						? await Promise.race([inputPromise, attemptGuard.interrupted])
+						: await inputPromise;
 					for await (const event of guardedEvents(input, attemptGuard)) {
 						if (signal?.aborted) throw cancellationError();
 						const deadlineExpired = attemptGuard?.deadlineExpired() ?? false;
@@ -850,6 +885,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							!substantiveContentExists(event.error) &&
 							kind !== undefined
 						) {
+							excludeAttemptEndpoint(event.error);
 							lastRetryableFailure = event.error;
 							if (
 								transientUpstream5xxMode === "retry-5m" &&
@@ -929,6 +965,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						!substantiveContentExists(error && typeof error === "object" ? (error as AssistantLike) : undefined) &&
 						kind !== undefined
 					) {
+						excludeAttemptEndpoint(error);
 						lastRetryableFailure = error && typeof error === "object" ? (error as AssistantLike) : undefined;
 						if (
 							transientUpstream5xxMode === "retry-5m" &&

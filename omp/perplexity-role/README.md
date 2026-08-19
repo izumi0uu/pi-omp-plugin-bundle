@@ -26,7 +26,7 @@ The launch overlay can resolve `@perplexity`, but the `/model` Roles editor only
 
 ```yaml
 modelRoles:
-  perplexity: tokenking-grok-queued/grok-4.5:high
+  perplexity: tokenking-grok/grok-4.6:high
 ```
 
 The global entry only exposes the model alias. Perplexity-first search routing, the search prompt, tool restriction, and session isolation still come from the `omp-perplexity` launcher; merely selecting this role in an ordinary OMP window does not enable those behaviors.
@@ -38,4 +38,4 @@ omp-perplexity --resume
 omp-perplexity -p "What changed in Node.js this week?"
 ```
 
-The Perplexity account supplies search results; the configured `tokenking-grok-queued/grok-4.5:high` model synthesizes the final answer. Perplexity OAuth does not expose a chat model in OMP 17.2.4, so the role cannot map directly to a Perplexity model.
+The Perplexity account supplies search results; the configured `tokenking-grok/grok-4.6:high` model synthesizes the final answer. The universal adaptive retry extension wraps this normal provider selector automatically. Perplexity OAuth does not expose a chat model in OMP 17.2.4, so the role cannot map directly to a Perplexity model.

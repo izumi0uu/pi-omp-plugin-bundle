@@ -1,23 +1,16 @@
 modelRoles:
-  default: aiinput-queued/gpt-5.6-sol:max
-  research: tokenking-grok-queued/grok-4.5:high
+  default: aiinput/gpt-5.6-sol:max
+  research: tokenking-grok/grok-4.6:high
 
 retry:
-  # The extension owns transient concurrency retries. Keep OMP's outer retry
-  # loop disabled so 5xx failures can move through the fallback chain once.
+  # The extension wraps every model transport and owns managed retries.
   maxRetries: 0
   modelFallback: true
   fallbackRevertPolicy: cooldown-expiry
   fallbackChains:
-    aiinput-queued/*:
-      - tokenking-queued/gpt-5.6-sol:max
-      - tokenking/gpt-5.6-sol:max
     aiinput/*:
-      - tokenking-queued/gpt-5.6-sol:max
       - tokenking/gpt-5.6-sol:max
-    aiinput2-overseas-queued/*:
-      - tokenking-queued/gpt-5.6-sol:max
-      - tokenking/gpt-5.6-sol:max
-    tokenking-grok-queued/*:
-      - tokenking-queued/gpt-5.6-sol:max
-      - tokenking/gpt-5.6-sol:max
+    kimi-code/*:
+      - aiinput/gpt-5.6-sol:max
+    tokenking-grok/*:
+      - aiinput/gpt-5.6-sol:max

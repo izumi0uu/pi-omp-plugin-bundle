@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+- Replace provider-specific `*-queued` registrations with one universal model
+  transport wrapper. Every model request dispatched through OMP `streamSimple`
+  now receives the retry policy while preserving its original selector,
+  credentials, model metadata, and API transport.
+- Add an AI Input endpoint router for `ai.input.im`, `eo.input.codes`, and
+  `input.codes`. It scores only latency EWMA plus 1.5 times jitter EWMA, probes
+  every 30 seconds, retains eight samples, and uses two-round 20% hysteresis.
+- Keep all provider-error semantics in Universal Retry. Transport and generic
+  `502/503/504` failures temporarily exclude the current AI Input URL for the
+  next attempt; rate limits, authentication, quota, and model failures do not.
+- Add `/aiinput-route status|refresh|auto|pin`, credential-free shared automatic
+  route state, cancellation-safe initial probing, and one logical AI Input
+  retry lane across routed URLs. Manual pins are session-scoped, accept the
+  `ai`, `eo`, and `input` aliases, and optionally expire after a bounded
+  duration such as `30m` or `2h`.
+- Keep latency probes and the cached automatic candidate active during a
+  session pin. A pin overrides Retry URL exclusions until it expires or that
+  session returns to `auto`; other top-level OMP sessions remain independent.
+- Bind persisted route-policy entries to their originating session ID. Resuming
+  that session restores its pin, while a fork that copies the branch entries
+  starts in automatic routing instead of inheriting the source session's pin.
+- Resolve OMP's rotating and derived provider request IDs through the owning
+  provider-state object and parent lineage. `/fresh`, `/clear`, Advisor,
+  `/btw`, and `/tan` therefore retain the current session's route without
+  leaking it to a different session.
+- Restore route policy from the complete session entry set while leaving retry
+  policy branch-local, so history-tree navigation cannot silently clear a
+  session-wide endpoint pin.
+- Keep the shared route-state schema readable by already-open extension
+  instances during rolling reload. New instances omit global pin fields; old
+  instances therefore read the shared state as `auto` instead of resetting it.
+- Keep concurrent probe cancellation request-local, abort old probes on reload,
+  follow OMP's provider-aware proxy selection, and fail open when local route
+  state is unavailable.
+- Preserve the cached selected URL when every endpoint lacks a sample in the
+  current probe round; a request-local Retry exclusion still takes precedence.
+- Exercise endpoint rotation with the real Router and Retry implementations,
+  including sole-waiter cancellation followed immediately by a new request.
+- Resolve an AI Input credential once per logical request, then seed OMP's
+  original resolver so the probe, retry lane, and first model attempt retain
+  credential affinity without disabling later auth refresh or account rotation.
+- Remove the active `aiinput-overseas` provider alias; the single `aiinput`
+  selector now routes across all three URLs.
+- Remove `aiinput-queued`, `aiinput-overseas-queued`,
+  `aiinput2-overseas-queued`, `tokenking-queued`,
+  `tokenking-grok-queued`, and `kimi-code-queued`, along with the Kimi and
+  Responses adapter code used only by those aliases.
+- Verify the universal transport path with OMP `17.3.5`, including a real
+  provider-dispatch smoke test that recovers from an HTTP 500 overload through
+  the original API transport.
+- Make `retry-stop` the default for new sessions and sessions without a saved
+  policy, so managed failures exhaust their local 50-retry budget without
+  entering OMP fallback.
+- Treat OMP's status-less `Unable to connect` transport error as retryable, so
+  adaptive retry modes handle local proxy and endpoint connection failures
+  instead of immediately entering OMP fallback.
+- Bridge configured `anthropic-beta` values into the final outgoing request
+  through a request-local `fetch` wrapper as well as OMP's protected `betas`
+  option. This preserves and deduplicates existing beta values on OMP releases
+  that discard `betas` during option normalization, without changing global
+  `fetch` or non-Anthropic transports.
+
 ## 0.7.0 - 2026-08-12
 
 - Add `/adaptive-5xx retry-stop`. Managed pre-content transient failures use an

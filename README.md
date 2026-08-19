@@ -15,7 +15,7 @@ pi-omp-plugin-bundle/
 
 | Runtime | Plugin | Status |
 |---|---|---|
-| OMP 17.2.12 | `adaptive-provider-queue` | Locally verified; other versions unverified |
+| OMP 17.3.5 | `adaptive-provider-queue` | Universal retry plus AI Input latency/jitter endpoint routing; locally verified |
 | OMP 17.2.x | `omp-pi-tool-display` | Ported from upstream `v0.5.0`; pure tests and isolated OMP 17.2.4 load verified |
 | OMP Role | `perplexity` | Dedicated main-agent window using Perplexity-first `web_search` |
 | Pi | - | Reserved for native Pi ports |
@@ -40,7 +40,7 @@ omp plugin link .
 omp plugin install .
 ```
 
-在 OMP 17.2.2 中，这两条本地路径命令都会创建 symlink；移动或删除 checkout 会使插件失效。只开发当前插件时，也可以把某一个子目录作为安装目标，但切换前应先卸载原来的 bundle 或子包。
+本地路径安装会创建 symlink；移动或删除 checkout 会使插件失效。只开发当前插件时，也可以把某一个子目录作为安装目标，但切换前应先卸载原来的 bundle 或子包。
 
 ```bash
 # 切换到子包安装前
@@ -53,7 +53,7 @@ omp plugin uninstall omp-adaptive-provider-queue
 omp plugin uninstall omp-pi-tool-display
 ```
 
-如需只预览操作，使用 `omp plugin install PATH --dry-run`。OMP 17.2.2 的 `omp plugin link PATH --dry-run` 仍会实际创建链接。
+如需只预览操作，使用 `omp plugin install PATH --dry-run`。
 
 发布到 GitHub 后使用仓库根安装，因为 OMP 的 GitHub source 不支持选择仓库子目录：
 
@@ -61,7 +61,7 @@ omp plugin uninstall omp-pi-tool-display
 omp plugin install github:izumi0uu/pi-omp-plugin-bundle#COMMIT_OR_TAG
 ```
 
-同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 provider 或工具。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md)、[`omp/adaptive-provider-queue/RETRY-STRATEGY.md`](omp/adaptive-provider-queue/RETRY-STRATEGY.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
+同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 transport、命令或工具。`adaptive-provider-queue` 会透明包装所有普通 OMP 模型请求；roles 和 fallback chains 继续使用原始 provider 名称，不再配置任何 `*-queued` selector。AI Input 只保留一个 provider，由插件在三个白名单 URL 间按延迟和抖动选择。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md)、[`omp/adaptive-provider-queue/RETRY-STRATEGY.md`](omp/adaptive-provider-queue/RETRY-STRATEGY.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
 
 `perplexity` 是窗口专用的 model role，不是插件或 task agent。安装配置和启动器后直接打开搜索窗口：
 

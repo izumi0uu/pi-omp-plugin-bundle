@@ -24,12 +24,12 @@ export interface RetryStatusTarget {
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
-	"aiinput-queued": "AI Input",
-	"aiinput-overseas-queued": "AI Input overseas",
-	"aiinput2-overseas-queued": "AI Input 2 overseas",
-	"tokenking-queued": "TokenKing",
-	"tokenking-grok-queued": "TokenKing Grok",
-	"kimi-code-queued": "Kimi Code",
+	aiinput: "AI Input",
+	"aiinput-overseas": "AI Input overseas",
+	"aiinput2-overseas": "AI Input 2 overseas",
+	tokenking: "TokenKing",
+	"tokenking-grok": "TokenKing Grok",
+	"kimi-code": "Kimi Code",
 };
 
 function progressBar(attempt: number, maxRetries: number): string {

@@ -1,24 +1,50 @@
+import {
+	resolveAiInputEndpoint,
+	type AiInputEndpointId,
+} from "./aiinput-router.ts";
+
 export const ADAPTIVE_5XX_POLICY_ENTRY = "adaptive-provider-queue:5xx-policy";
 export const ADAPTIVE_SHARE_POLICY_ENTRY = "adaptive-provider-queue:share-policy";
-export const DEFAULT_TRANSIENT_UPSTREAM_MODE = "retry" as const;
+export const ADAPTIVE_AIINPUT_ROUTE_POLICY_ENTRY = "adaptive-provider-queue:aiinput-route-policy";
+export const DEFAULT_TRANSIENT_UPSTREAM_MODE = "retry-stop" as const;
 export const DEFAULT_SHARED_RETRY_RECOVERY = false;
 export const TRANSIENT_UPSTREAM_RETRY_WINDOW_MS = 300_000;
+const MAX_AIINPUT_PIN_DURATION_MS = 365 * 24 * 60 * 60 * 1_000;
 
 export const TRANSIENT_UPSTREAM_MODE_ORDER = ["retry", "retry-stop", "retry-5m", "fallback"] as const;
 
 export type TransientUpstreamMode = (typeof TRANSIENT_UPSTREAM_MODE_ORDER)[number];
 export type TransientUpstreamModeCommand = TransientUpstreamMode | "status" | "list";
 
+export type SessionAiInputRoutePolicy =
+	| { readonly mode: "auto" }
+	| {
+		readonly mode: "pinned";
+		readonly endpointId: AiInputEndpointId;
+		readonly expiresAt?: number;
+	};
+
+export type AiInputRouteCommand =
+	| { readonly action: "status" | "refresh" | "auto" }
+	| {
+		readonly action: "pin";
+		readonly endpointId: AiInputEndpointId;
+		readonly expiresAt?: number;
+	};
+
 export interface SessionPolicyStore {
-	readonly version: 3;
+	readonly version: 5;
 	readonly modes: Map<string, TransientUpstreamMode>;
 	readonly sharedRetryRecovery: Map<string, boolean>;
+	readonly aiInputRoutes: Map<string, SessionAiInputRoutePolicy>;
 	readonly rootSessionIds: Map<string, string>;
 	readonly rootSessionIdsByArtifactsDir: Map<string, string>;
+	readonly providerSessionRootIds: Map<string, string>;
+	providerStateRootIds: WeakMap<object, string>;
 	activeInteractiveSessionId?: string;
 }
 
-const SHARED_SESSION_POLICY_STORE = Symbol.for("omp.adaptive-provider-queue.session-policy.v3");
+const SHARED_SESSION_POLICY_STORE = Symbol.for("omp.adaptive-provider-queue.session-policy.v5");
 
 interface SessionEntryLike {
 	type?: unknown;
@@ -38,6 +64,27 @@ function sharedRetryRecoveryFromData(data: unknown): boolean | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const enabled = (data as Record<string, unknown>).enabled;
 	return typeof enabled === "boolean" ? enabled : undefined;
+}
+
+function aiInputRoutePolicyFromData(
+	data: unknown,
+	expectedSessionId: string,
+): SessionAiInputRoutePolicy | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const source = data as Record<string, unknown>;
+	if (source.sessionId !== expectedSessionId) return undefined;
+	if (source.mode === "auto") return { mode: "auto" };
+	if (source.mode !== "pinned" || typeof source.endpointId !== "string") return undefined;
+	const endpoint = resolveAiInputEndpoint(source.endpointId);
+	if (!endpoint) return undefined;
+	const expiresAt = typeof source.expiresAt === "number" && Number.isFinite(source.expiresAt)
+		? source.expiresAt
+		: undefined;
+	return {
+		mode: "pinned",
+		endpointId: endpoint.id,
+		...(expiresAt === undefined ? {} : { expiresAt }),
+	};
 }
 
 export function recordedTransientUpstreamMode(entries: readonly unknown[]): TransientUpstreamMode | undefined {
@@ -68,13 +115,29 @@ export function sharedRetryRecoveryFromEntries(entries: readonly unknown[]): boo
 	return recordedSharedRetryRecovery(entries) ?? DEFAULT_SHARED_RETRY_RECOVERY;
 }
 
+export function recordedAiInputRoutePolicy(
+	entries: readonly unknown[],
+	expectedSessionId: string,
+): SessionAiInputRoutePolicy | undefined {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index] as SessionEntryLike | undefined;
+		if (entry?.type !== "custom" || entry.customType !== ADAPTIVE_AIINPUT_ROUTE_POLICY_ENTRY) continue;
+		const policy = aiInputRoutePolicyFromData(entry.data, expectedSessionId);
+		if (policy) return policy;
+	}
+	return undefined;
+}
+
 export function createSessionPolicyStore(): SessionPolicyStore {
 	return {
-		version: 3,
+		version: 5,
 		modes: new Map<string, TransientUpstreamMode>(),
 		sharedRetryRecovery: new Map<string, boolean>(),
+		aiInputRoutes: new Map<string, SessionAiInputRoutePolicy>(),
 		rootSessionIds: new Map<string, string>(),
 		rootSessionIdsByArtifactsDir: new Map<string, string>(),
+		providerSessionRootIds: new Map<string, string>(),
+		providerStateRootIds: new WeakMap<object, string>(),
 	};
 }
 
@@ -82,11 +145,14 @@ function isSessionPolicyStore(value: unknown): value is SessionPolicyStore {
 	if (!value || typeof value !== "object") return false;
 	const candidate = value as Partial<SessionPolicyStore>;
 	return (
-		candidate.version === 3 &&
+		candidate.version === 5 &&
 		candidate.modes instanceof Map &&
 		candidate.sharedRetryRecovery instanceof Map &&
+		candidate.aiInputRoutes instanceof Map &&
 		candidate.rootSessionIds instanceof Map &&
-		candidate.rootSessionIdsByArtifactsDir instanceof Map
+		candidate.rootSessionIdsByArtifactsDir instanceof Map &&
+		candidate.providerSessionRootIds instanceof Map &&
+		candidate.providerStateRootIds instanceof WeakMap
 	);
 }
 
@@ -105,6 +171,7 @@ export function restoreSessionPolicy(
 	input: {
 		sessionId: string;
 		entries: readonly unknown[];
+		routeEntries?: readonly unknown[];
 		hasUI: boolean;
 		lineageSessionId?: string;
 		artifactsDir?: string;
@@ -120,12 +187,17 @@ export function restoreSessionPolicy(
 	if (input.artifactsDir && !artifactRoot) {
 		store.rootSessionIdsByArtifactsDir.set(input.artifactsDir, rootSessionId);
 	}
+	if (input.hasUI && store.activeInteractiveSessionId !== input.sessionId) {
+		store.providerStateRootIds = new WeakMap<object, string>();
+	}
 
 	const recorded = recordedTransientUpstreamMode(input.entries);
 	const recordedSharedRecovery = recordedSharedRetryRecovery(input.entries);
+	const recordedRoute = recordedAiInputRoutePolicy(input.routeEntries ?? input.entries, input.sessionId);
 	if (rootSessionId === input.sessionId) {
 		store.modes.set(rootSessionId, recorded ?? DEFAULT_TRANSIENT_UPSTREAM_MODE);
 		store.sharedRetryRecovery.set(rootSessionId, recordedSharedRecovery ?? DEFAULT_SHARED_RETRY_RECOVERY);
+		store.aiInputRoutes.set(rootSessionId, recordedRoute ?? { mode: "auto" });
 	}
 	if (input.hasUI) store.activeInteractiveSessionId = input.sessionId;
 	return sessionPolicyMode(store, input.sessionId);
@@ -145,6 +217,14 @@ export function setSessionSharedRetryRecovery(
 	enabled: boolean,
 ): void {
 	store.sharedRetryRecovery.set(store.rootSessionIds.get(sessionId) ?? sessionId, enabled);
+}
+
+export function setSessionAiInputRoutePolicy(
+	store: SessionPolicyStore,
+	sessionId: string,
+	policy: SessionAiInputRoutePolicy,
+): void {
+	store.aiInputRoutes.set(store.rootSessionIds.get(sessionId) ?? sessionId, policy);
 }
 
 export function sessionPolicyMode(
@@ -176,6 +256,99 @@ export function sessionSharedRetryRecovery(
 		return store.sharedRetryRecovery.get(store.activeInteractiveSessionId) ?? DEFAULT_SHARED_RETRY_RECOVERY;
 	}
 	return DEFAULT_SHARED_RETRY_RECOVERY;
+}
+
+export function sessionAiInputRoutePolicy(
+	store: SessionPolicyStore,
+	sessionId: string | undefined,
+	now = Date.now(),
+): SessionAiInputRoutePolicy {
+	const rootSessionId = sessionId
+		? store.rootSessionIds.get(sessionId) ?? sessionId
+		: store.activeInteractiveSessionId;
+	const policy = rootSessionId ? store.aiInputRoutes.get(rootSessionId) : undefined;
+	if (!policy || policy.mode === "auto") return { mode: "auto" };
+	if (policy.expiresAt !== undefined && policy.expiresAt <= now) {
+		if (rootSessionId) store.aiInputRoutes.set(rootSessionId, { mode: "auto" });
+		return { mode: "auto" };
+	}
+	return policy;
+}
+
+function knownRootSessionId(store: SessionPolicyStore, sessionId: string): string | undefined {
+	const rootSessionId =
+		store.rootSessionIds.get(sessionId) ??
+		store.providerSessionRootIds.get(sessionId) ??
+		(store.aiInputRoutes.has(sessionId) ? sessionId : undefined);
+	return rootSessionId && store.aiInputRoutes.has(rootSessionId) ? rootSessionId : undefined;
+}
+
+function derivedProviderRootSessionId(store: SessionPolicyStore, sessionId: string): string | undefined {
+	const markerIndex = Math.max(sessionId.lastIndexOf(":side:"), sessionId.lastIndexOf(":tan:"));
+	if (markerIndex <= 0) return undefined;
+	const parentSessionId = sessionId.slice(0, markerIndex);
+	return knownRootSessionId(store, parentSessionId) ?? derivedProviderRootSessionId(store, parentSessionId);
+}
+
+function providerStateObject(value: unknown): object | undefined {
+	return value !== null && (typeof value === "object" || typeof value === "function")
+		? value as object
+		: undefined;
+}
+
+function bindProviderRequestToRoot(
+	store: SessionPolicyStore,
+	input: { sessionId?: string; providerSessionState?: unknown },
+	rootSessionId: string,
+	rememberSessionId: boolean,
+): void {
+	if (rememberSessionId && input.sessionId) {
+		store.providerSessionRootIds.set(input.sessionId, rootSessionId);
+	}
+	const state = providerStateObject(input.providerSessionState);
+	const activeRoot = store.activeInteractiveSessionId
+		? store.rootSessionIds.get(store.activeInteractiveSessionId) ?? store.activeInteractiveSessionId
+		: undefined;
+	if (state && (!activeRoot || activeRoot === rootSessionId)) {
+		store.providerStateRootIds.set(state, rootSessionId);
+	}
+}
+
+/** Resolves OMP's rotating and derived provider IDs back to the owning top-level session. */
+export function providerRequestAiInputRoutePolicy(
+	store: SessionPolicyStore,
+	input: { sessionId?: string; providerSessionState?: unknown },
+	now = Date.now(),
+): SessionAiInputRoutePolicy {
+	const directRoot = input.sessionId ? knownRootSessionId(store, input.sessionId) : undefined;
+	if (directRoot) {
+		bindProviderRequestToRoot(store, input, directRoot, false);
+		return sessionAiInputRoutePolicy(store, directRoot, now);
+	}
+
+	const derivedRoot = input.sessionId
+		? derivedProviderRootSessionId(store, input.sessionId)
+		: undefined;
+	if (derivedRoot) {
+		bindProviderRequestToRoot(store, input, derivedRoot, false);
+		return sessionAiInputRoutePolicy(store, derivedRoot, now);
+	}
+
+	const state = providerStateObject(input.providerSessionState);
+	const stateRoot = state ? store.providerStateRootIds.get(state) : undefined;
+	if (stateRoot && store.aiInputRoutes.has(stateRoot)) {
+		bindProviderRequestToRoot(store, input, stateRoot, true);
+		return sessionAiInputRoutePolicy(store, stateRoot, now);
+	}
+
+	const activeRoot = store.activeInteractiveSessionId
+		? store.rootSessionIds.get(store.activeInteractiveSessionId) ?? store.activeInteractiveSessionId
+		: undefined;
+	if (activeRoot && store.aiInputRoutes.has(activeRoot)) {
+		bindProviderRequestToRoot(store, input, activeRoot, true);
+		return sessionAiInputRoutePolicy(store, activeRoot, now);
+	}
+	return { mode: "auto" };
 }
 
 export function parseTransientUpstreamModeCommand(
@@ -225,6 +398,34 @@ export function parseSharedRetryRecoveryCommand(
 	if (action === "off") return false;
 	if (action === "toggle") return !current;
 	return undefined;
+}
+
+export function parseAiInputRouteCommand(args: string, now = Date.now()): AiInputRouteCommand | undefined {
+	const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+	if (tokens.length === 0 || (tokens.length === 1 && tokens[0] === "status")) {
+		return { action: "status" };
+	}
+	if (tokens.length === 1 && (tokens[0] === "refresh" || tokens[0] === "auto")) {
+		return { action: tokens[0] };
+	}
+	if (tokens[0] !== "pin" || tokens.length < 2 || tokens.length > 3) return undefined;
+	const endpoint = resolveAiInputEndpoint(tokens[1]);
+	if (!endpoint) return undefined;
+	if (tokens.length === 2) return { action: "pin", endpointId: endpoint.id };
+
+	const duration = tokens[2].match(/^([1-9]\d*)(s|m|h|d)$/);
+	if (!duration) return undefined;
+	const amount = Number(duration[1]);
+	const unitMs = duration[2] === "s"
+		? 1_000
+		: duration[2] === "m"
+			? 60_000
+			: duration[2] === "h"
+				? 3_600_000
+				: 86_400_000;
+	const durationMs = amount * unitMs;
+	if (!Number.isSafeInteger(durationMs) || durationMs > MAX_AIINPUT_PIN_DURATION_MS) return undefined;
+	return { action: "pin", endpointId: endpoint.id, expiresAt: now + durationMs };
 }
 
 export function formatAdaptivePolicyStatus(

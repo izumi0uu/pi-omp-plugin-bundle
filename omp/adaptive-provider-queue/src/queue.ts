@@ -100,11 +100,13 @@ function sanitizeEndpoint(baseUrl: string | undefined): string {
 export function createLaneId(input: {
 	provider: string;
 	baseUrl?: string;
+	laneScope?: string;
 	apiKey?: unknown;
 }): string {
 	const credentialScope = typeof input.apiKey === "string" && input.apiKey.length > 0 ? input.apiKey : input.provider;
+	const endpointScope = input.laneScope ? `scope:${input.laneScope.trim().toLowerCase()}` : sanitizeEndpoint(input.baseUrl);
 	return createHash("sha256")
-		.update(`${sanitizeEndpoint(input.baseUrl)}\0${credentialScope}`)
+		.update(`${endpointScope}\0${credentialScope}`)
 		.digest("base64url");
 }
 

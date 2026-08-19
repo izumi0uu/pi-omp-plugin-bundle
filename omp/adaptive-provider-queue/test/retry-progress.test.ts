@@ -9,7 +9,7 @@ import {
 } from "../src/retry-progress.ts";
 
 const retrying: AdaptiveRetryProgress = {
-	provider: "tokenking-queued",
+	provider: "tokenking",
 	model: "gpt-5.6-sol",
 	phase: "backoff",
 	attempt: 2,
@@ -22,7 +22,7 @@ const retrying: AdaptiveRetryProgress = {
 test("retry progress renders a compact fixed-width ASCII bar", () => {
 	assert.equal(formatRetryProgress(retrying), "TokenKing retry 2/50 [#-----------] transport q1/2");
 	assert.equal(
-		formatRetryProgress({ ...retrying, provider: "aiinput2-overseas-queued" }),
+		formatRetryProgress({ ...retrying, provider: "aiinput2-overseas" }),
 		"AI Input 2 overseas retry 2/50 [#-----------] transport q1/2",
 	);
 	assert.equal(
@@ -40,7 +40,7 @@ test("retry progress renders a compact fixed-width ASCII bar", () => {
 	assert.equal(
 		formatRetryProgress({
 			...retrying,
-			provider: "aiinput-overseas-queued",
+			provider: "aiinput-overseas",
 			attempt: 4,
 			retryWindowMs: 300_000,
 			retryWindowRemainingMs: 192_000,
