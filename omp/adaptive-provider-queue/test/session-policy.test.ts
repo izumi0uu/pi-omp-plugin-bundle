@@ -105,8 +105,8 @@ test("the mode list documents the same order used by toggle", () => {
 			"Adaptive retry modes:",
 			"  retry: managed errors retry 50x, then OMP fallback",
 			"> retry-stop: managed errors retry 50x, then stop without fallback",
-			"  retry-5m: ordinary 502/503/504 retry for 5m, then OMP fallback",
-			"  fallback: ordinary 502/503/504 immediately enter OMP fallback",
+			"  retry-5m: ordinary 502/503/504/524 retry for 5m, then OMP fallback",
+			"  fallback: ordinary 502/503/504/524 immediately enter OMP fallback",
 			"toggle: retry -> retry-stop -> retry-5m -> fallback -> retry",
 		].join("\n"),
 	);

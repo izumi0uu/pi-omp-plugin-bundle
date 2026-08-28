@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Add guarded `/provider-remove` and `/provider-delete` commands for listing
+  configured providers, removing one exact `provider/model`, or removing a
+  whole provider from `models.yml`. Deletions support `--dry-run`, interactive
+  confirmation, `--yes`, and `--force`, create timestamped backups, preserve
+  credentials, and use atomic replacement.
+- Document AgentRouter long-session socket disconnects, the distinction between a
+  new OMP window and a new session, and the no-replay boundary after partial output.
+- Classify Anthropic streams that end before `message_stop` as transient
+  transport failures, while retaining the existing no-replay guard after
+  substantive output.
+- Log when a retryable stream is intentionally not replayed because partial
+  text, tool-call, or image output has already crossed the replay boundary.
+- Make `retry-stop` exhaustion parent-visible for subagents: emit a terminal
+  `error` with the `ADAPTIVE_RETRY_EXHAUSTED` marker, preserve a bounded
+  credential-redacted provider report in child output, and retain OMP's Abort
+  classification only to suppress a second retry/fallback pass.
+- Revalidate the transport and terminal-error classification against OMP
+  `18.0.0`.
 - Replace provider-specific `*-queued` registrations with one universal model
   transport wrapper. Every model request dispatched through OMP `streamSimple`
   now receives the retry policy while preserving its original selector,
@@ -10,7 +28,7 @@
   `input.codes`. It scores only latency EWMA plus 1.5 times jitter EWMA, probes
   every 30 seconds, retains eight samples, and uses two-round 20% hysteresis.
 - Keep all provider-error semantics in Universal Retry. Transport and generic
-  `502/503/504` failures temporarily exclude the current AI Input URL for the
+  `502/503/504/524` failures temporarily exclude the current AI Input URL for the
   next attempt; rate limits, authentication, quota, and model failures do not.
 - Add `/aiinput-route status|refresh|auto|pin`, credential-free shared automatic
   route state, cancellation-safe initial probing, and one logical AI Input
@@ -63,6 +81,15 @@
   option. This preserves and deduplicates existing beta values on OMP releases
   that discard `betas` during option normalization, without changing global
   `fetch` or non-Anthropic transports.
+- Bridge `agentrouter/gpt-5.6-sol` through OMP's accepted Codex request
+  transport while rewriting only AgentRouter's unsupported Codex response path
+  to `/v1/responses`. The request-local adapter preserves Codex identity,
+  credentials, proxy and retry state without changing global `fetch` or other
+  providers.
+- Recognize `agentrouter`, `agentrouter-2`, and `agentrouter-3` as one fallback-
+  compatible provider family. Explicit AgentRouter quota exhaustion is handed
+  to OMP immediately so the configured account chain can advance without a
+  50-attempt retry delay.
 
 ## 0.7.0 - 2026-08-12
 

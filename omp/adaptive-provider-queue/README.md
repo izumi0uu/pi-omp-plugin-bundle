@@ -38,6 +38,16 @@ also works on OMP versions that discard `betas` during option normalization.
 Existing beta values are preserved and deduplicated; global `fetch`, credentials,
 and non-Anthropic transports are unchanged.
 
+AgentRouter accepts OMP's Codex request identity but exposes GPT Responses at
+`/v1/responses` rather than OMP's Codex-specific `/codex/responses` path. For an
+`agentrouter`, `agentrouter-2`, or `agentrouter-3` GPT model declared with
+`api: openai-codex-responses`, the wrapper rewrites only that final request path
+on `https://agentrouter.org` and supplies the client identity required by the
+gateway. Codex headers, body, reasoning effort, credentials, proxy selection,
+retry signals, and SSE parsing remain owned by OMP. Other AgentRouter routes and
+all other providers pass through unchanged; remote Codex compaction should
+remain disabled because AgentRouter does not expose OMP's compaction endpoint.
+
 ## Default policy
 
 New sessions default to `retry-stop` and isolated recovery:
@@ -50,11 +60,44 @@ New sessions default to `retry-stop` and isolated recovery:
 - OMP's outer retry loop should remain disabled with `retry.maxRetries: 0`.
 
 Managed pre-content failures include concurrency and rate limits, explicit
-server overload, generic `502/503/504`, transient connection and stream errors,
+server overload, generic `502/503/504/524`, transient connection and stream errors,
 `401/402/403`, revoked or invalid credentials, quota/billing exhaustion, and
 explicit model/capacity/route unavailability. Ordinary unclassified request
 errors pass through to OMP. Once text, a tool call, or an image has been
 emitted, the extension never replays that partial response.
+
+AgentRouter has one deliberate exception to the default local retry policy:
+when an `agentrouter`, `agentrouter-2`, or `agentrouter-3` request contains an
+explicit quota/billing exhaustion signal such as `insufficient_user_quota`, the
+wrapper releases its local retry ticket immediately and forwards that error to
+OMP. OMP then follows the configured provider fallback chain. Generic `401`,
+`403`, revoked credentials, and ordinary rate limits do not match this shortcut;
+they retain the normal retry behavior.
+
+### Subagent error handoff
+
+Subagents load the same extension by path when OMP creates their session, so
+their provider requests use this retry wrapper and inherit the root session's
+retry policy through session lineage. On `retry-stop` exhaustion, the wrapper
+emits a terminal `error` (not a synthetic cancellation) with the stable
+`ADAPTIVE_RETRY_EXHAUSTED` marker. The OMP Abort classification bit is attached
+only to suppress OMP's second retry/fallback pass; the task executor can still
+copy the terminal `errorMessage` into the parent task result.
+
+The child output also contains a bounded, credential-redacted report:
+
+```text
+ADAPTIVE_RETRY_EXHAUSTED
+provider: kimi-code
+model: k3
+retries: 50/50
+fallback: suppressed
+status: 503
+last_error: Service temporarily unavailable
+```
+
+The parent therefore receives both a failed task result and the useful provider
+diagnostic. Successful child yields and ordinary OMP task events are unchanged.
 
 ## AI Input Endpoint Router
 
@@ -85,7 +128,7 @@ only: routing falls open to the cached or configured AI Input URL and does not
 send the model request into fallback.
 
 Universal Retry owns all error semantics. For a transport error or generic
-`502/503/504`, it temporarily excludes the URL for the next attempt; `429`,
+`502/503/504/524`, it temporarily excludes the URL for the next attempt; `429`,
 authentication, quota, and model errors do not cause a route change. Once all
 three URLs have been tried in the current request, the exclusion set resets.
 The router never retries a stream or classifies a provider response.
@@ -150,8 +193,8 @@ Use `/adaptive-5xx` to inspect or change what happens around managed failures:
 |---|---|
 | `retry-stop` | Default. Retry managed failures locally up to 50 times, then stop the turn without OMP fallback. |
 | `retry` | Retry managed failures up to 50 times, then forward the final error to OMP fallback. |
-| `retry-5m` | Retry generic `502/503/504` locally for at most five minutes, then use fallback; other managed failures retain the 50-retry policy. |
-| `fallback` | Send generic `502/503/504` directly to fallback; other managed failures retain the 50-retry policy. |
+| `retry-5m` | Retry generic `502/503/504/524` locally for at most five minutes, then use fallback; other managed failures retain the 50-retry policy. |
+| `fallback` | Send generic `502/503/504/524` directly to fallback; other managed failures retain the 50-retry policy. |
 
 The command name is retained for history compatibility, although the final
 stop-versus-fallback decision now applies to all managed failures. The selected
@@ -202,10 +245,100 @@ retry:
       - aiinput/gpt-5.6-sol:max
     tokenking-grok/*:
       - aiinput/gpt-5.6-sol:max
+    agentrouter/*:
+      - agentrouter-2/*
+      - agentrouter-3/*
+    agentrouter-2/*:
+      - agentrouter-3/*
+    justworker/*:
+      - justworker-2/*
+      - justworker-3/*
+    justworker-2/*:
+      - justworker-3/*
 ```
+
+With this chain, a failing `agentrouter/gpt-5.6-sol` keeps the model id while
+moving through `agentrouter-2/gpt-5.6-sol` and then
+`agentrouter-3/gpt-5.6-sol`. There is intentionally no reverse edge from
+`agentrouter-3` back to `agentrouter`, so a failed account cannot create a
+fallback loop.
+
+The same account-fallback pattern works for independent JustWorker
+credentials: `justworker/*` -> `justworker-2/*` -> `justworker-3/*`. Explicit
+quota or billing exhaustion on these aliases is forwarded to OMP's fallback
+chain immediately; ordinary transient failures continue to use the active
+retry policy.
 
 The extension does not define provider endpoints, API keys, or model entries.
 Keep those in OMP's built-in login store or `~/.omp/agent/models.yml` as usual.
+
+An AgentRouter provider can mix its native Anthropic models with the Codex
+transport used for GPT:
+
+```yaml
+providers:
+  agentrouter:
+    baseUrl: https://agentrouter.org
+    apiKey: AGENTROUTER_API_KEY
+    api: anthropic-messages
+    authHeader: true
+    disableStrictTools: true
+    models:
+      - id: claude-opus-5
+        api: anthropic-messages
+      - id: gpt-5.6-sol
+        api: openai-codex-responses
+        reasoning: true
+        remoteCompaction:
+          enabled: false
+```
+
+## AgentRouter 长任务与 socket 断流
+
+AgentRouter 是远端网关。长时间保持一个 Anthropic/Codex SSE 请求、在请求中等待
+subagent，或反复恢复一个很大的 session 时，网关可能在已经返回部分内容后关闭
+socket。常见错误包括：
+
+```text
+The socket connection was closed unexpectedly
+Anthropic stream envelope error: stream ended before message_stop
+Codex stream ended before terminal completion event
+```
+
+这类错误首先要区分“新窗口”和“新 session”：
+
+- `omp --resume <id>` 只是换了一个终端进程，仍会重新加载同一个历史、上下文和
+  session 级策略；窗口变新不会清空长上下文或遗留的 subagent 等待。
+- 真正的新 session 要直接从目标工作区启动 `omp`，不要带旧的 `--resume` ID。
+
+```bash
+cd /path/to/project
+omp --model agentrouter-2/claude-opus-5 --thinking max
+```
+
+恢复时建议把当前任务压缩成一段短 handoff，再把长任务拆成几个独立 session；
+不要让一个 session 长时间等待多个 subagent 后继续在同一条远端流上工作。
+
+重试边界也很重要。扩展只会对“尚未产生实质输出”的可管理错误进行本地重试。
+一旦已经发出文本、tool call 或图片，整轮重放会有重复写文件、重复执行工具或
+重复提交外部操作的风险，因此扩展会停止当前轮次并保留原错误。这时状态栏上的
+`5xx: retry 50x -> stop` 只是当前策略，不代表这次断流已经执行了 50 次重试。
+
+遇到断流时可按下面顺序判断：
+
+1. 查看当前策略：`/adaptive-5xx status`。
+2. 查看当前 OMP 进程日志，确认 provider、model、`contentBlocks` 和
+   `hasText`：
+
+   ```bash
+   rg -n -C 3 'socket connection|stream envelope|agent turn ended|adaptive provider' \
+     ~/.omp/logs/omp.*.log
+   ```
+
+3. 如果日志显示已经有文本或工具输出，直接新建 session 继续，不要反复
+   `--resume` 同一个大 session。
+4. 如果一个全新的短请求也失败，再检查 AgentRouter 网关状态、凭据和本机网络；
+   插件无法对已有副作用的半截流做无损重放。
 
 ## Installation
 
@@ -227,6 +360,35 @@ Do not load both a plugin-manager copy and a manual copy under
 can register commands and transports twice. After updating the extension, run
 `/reload` in every open OMP window or restart OMP.
 
+## Removing custom providers or models
+
+The extension includes a guarded editor for entries in
+`~/.omp/agent/models.yml`:
+
+```text
+/provider-remove list
+/provider-remove aiinput/gpt-5.6-sol --dry-run
+/provider-remove aiinput/gpt-5.6-sol
+/provider-remove justworker --force --yes
+```
+
+With no arguments, `/provider-remove` opens an interactive OMP selector: choose
+a provider, choose `Delete one model` or `Delete entire provider`, choose the
+model when needed, and confirm. This uses the same extension select/confirm UI
+surface as other OMP commands. OMP does not currently expose an extension hook
+for adding a button inside the built-in `/model` menu, so the selector is a
+separate command rather than a patch to OMP's internal menu.
+
+`/provider-delete` is an alias. Use either `provider/model` or the explicit
+`provider <name>` / `model <provider>/<model>` forms. Interactive deletion asks
+for confirmation; headless use requires `--yes`. `--dry-run` never writes. A
+whole-provider deletion is blocked when `config.yml` contains role or fallback
+references unless `--force` is supplied. Every real edit creates a
+timestamped `models.yml.bak-remove-*` backup and atomically replaces the file.
+Credentials in `.env` and OMP's login store are intentionally untouched.
+Restart OMP or run `/reload` after a successful edit so the in-memory registry
+is rebuilt. References are reported but never rewritten automatically.
+
 ## Verification
 
 ```bash
@@ -247,7 +409,7 @@ Expected results:
 
 ## Compatibility and state
 
-Verified with OMP `17.3.5`. The implementation depends on OMP exposing mutable
+Verified with OMP `18.0.0`. The implementation depends on OMP exposing mutable
 model registry entries and routing their `api` value through `streamSimple`.
 Future OMP releases that freeze or copy registry entries require revalidation.
 The package is OMP-native and is not declared compatible with standalone Pi.

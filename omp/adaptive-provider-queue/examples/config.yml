@@ -14,3 +14,15 @@ retry:
       - aiinput/gpt-5.6-sol:max
     tokenking-grok/*:
       - aiinput/gpt-5.6-sol:max
+    # AgentRouter accounts are independent credentials. Quota exhaustion on
+    # one account is forwarded to OMP so it can advance this ordered chain.
+    agentrouter/*:
+      - agentrouter-2/*
+      - agentrouter-3/*
+    agentrouter-2/*:
+      - agentrouter-3/*
+    justworker/*:
+      - justworker-2/*
+      - justworker-3/*
+    justworker-2/*:
+      - justworker-3/*

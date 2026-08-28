@@ -378,8 +378,8 @@ export function formatTransientUpstreamModeList(current: TransientUpstreamMode):
 	const modes: ReadonlyArray<readonly [TransientUpstreamMode, string]> = [
 		["retry", "managed errors retry 50x, then OMP fallback"],
 		["retry-stop", "managed errors retry 50x, then stop without fallback"],
-		["retry-5m", "ordinary 502/503/504 retry for 5m, then OMP fallback"],
-		["fallback", "ordinary 502/503/504 immediately enter OMP fallback"],
+		["retry-5m", "ordinary 502/503/504/524 retry for 5m, then OMP fallback"],
+		["fallback", "ordinary 502/503/504/524 immediately enter OMP fallback"],
 	];
 	return [
 		"Adaptive retry modes:",

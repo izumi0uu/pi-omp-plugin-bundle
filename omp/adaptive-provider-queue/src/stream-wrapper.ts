@@ -79,6 +79,8 @@ export interface AdaptiveStreamOptions<TOutput extends OutputStreamLike = Output
 	laneScope?: string;
 	resolveLaneApiKey?(): Promise<unknown>;
 	maxRetries?: number;
+	/** Forward explicit quota/billing exhaustion to OMP fallback without a local retry campaign. */
+	forwardQuotaToFallback?: boolean;
 	transientUpstream5xxMode?: TransientUpstreamMode;
 	upstream5xxRetryWindowMs?: number;
 	/** @deprecated Use transientUpstream5xxMode. */
@@ -103,6 +105,19 @@ export interface AdaptiveAttemptContext {
 
 export const DEFAULT_MAX_RETRIES = 50;
 
+/**
+ * OMP's pi-ai Abort bit. Keeping the terminal retry report in this class makes
+ * it non-retryable/non-fallback-eligible while `stopReason: "error"` lets the
+ * task executor copy `errorMessage` into the parent task result. This bit is
+ * stable across the OMP 17.x and 18.x versions supported by this extension.
+ */
+export const ADAPTIVE_TERMINAL_ABORT_ERROR_ID = 1 << 27;
+export const ADAPTIVE_RETRY_EXHAUSTED_CODE = "ADAPTIVE_RETRY_EXHAUSTED";
+
+const MAX_TERMINAL_ERROR_DETAIL_LENGTH = 800;
+const CREDENTIAL_PATTERN =
+	/\b(?:sk-[A-Za-z0-9_-]{12,}|(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}|(?:api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|secret|password)\s*[:=]\s*[^\s,;]+)\b/gi;
+
 export class AdaptiveRetryExhaustedError extends Error {
 	readonly code = "ADAPTIVE_RETRY_EXHAUSTED";
 	readonly attempt: number;
@@ -117,7 +132,7 @@ export class AdaptiveRetryExhaustedError extends Error {
 }
 
 export function adaptiveRetryStopMessage(maxRetries: number): string {
-	return `Adaptive provider stopped after ${maxRetries} retries; fallback suppressed for this turn.`;
+	return `${ADAPTIVE_RETRY_EXHAUSTED_CODE}: stopped after ${maxRetries} retries; fallback suppressed.`;
 }
 
 const QUOTA_OR_BILLING_PATTERN =
@@ -130,16 +145,16 @@ const AUTHENTICATION_HTTP_STATUS_PATTERN =
 	/(?:^|\b(?:http(?:[_ -]*error|[_ -]+status)?|status(?:[_ -]+code)?|error(?:[_ -]+code)?)[_ :=(-]+)(?:401|402|403)\b/i;
 const TRANSIENT_SERVER_OVERLOAD_PATTERN =
 	/server[_ -]?is[_ -]?overloaded|servers? (?:are )?(?:currently )?overloaded|server overload(?:ed)?/i;
-const TRANSIENT_SERVER_OVERLOAD_STATUSES = new Set([429, 500, 502, 503, 504]);
+const TRANSIENT_SERVER_OVERLOAD_STATUSES = new Set([429, 500, 502, 503, 504, 524]);
 const TRANSIENT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit(?:ed| exceeded)?|retry (?:again )?later/i;
 const EXPLICIT_RATE_LIMIT_PATTERN =
 	/concurren(?:cy|t)|too many pending requests|too many requests|rate[_ -]?limit[_ -]?exceeded|rate limit exceeded/i;
 const EXPLICIT_TRANSIENT_TRANSPORT_PATTERN =
-	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
+	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended (?:without (?:response\.completed|a terminal event)|before message_stop)/i;
 const TRANSIENT_TRANSPORT_PATTERN =
-	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|unable to connect|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended without (?:response\.completed|a terminal event)/i;
-const TRANSIENT_UPSTREAM_STATUSES = new Set([502, 503, 504]);
+	/stream[_ -]?read[_ -]?error|socket connection (?:was )?closed|connection (?:reset|closed|aborted)|unable to connect|(?:fetch|network) (?:failed|error)|econnreset|econnrefused|etimedout|timed? out|timeout|broken pipe|premature (?:stream|connection) close|upstream (?:reset|closed|disconnected)|up[_ -]?stream[_ -]?break|missing[_ -]?terminal|stream ended (?:without (?:response\.completed|a terminal event)|before message_stop)/i;
+const TRANSIENT_UPSTREAM_STATUSES = new Set([502, 503, 504, 524]);
 
 function errorText(error: unknown): string {
 	if (typeof error === "string") return error;
@@ -180,6 +195,50 @@ function errorStatus(error: unknown): number | undefined {
 		if (typeof value === "number") return value;
 	}
 	return undefined;
+}
+
+function sanitizeTerminalErrorDetail(error: unknown): string {
+	const normalized = errorText(error)
+		.replace(/[\u0000-\u001f\u007f\u0080-\u009f]+/g, " ")
+		.replace(/\s+/g, " ")
+		.replace(CREDENTIAL_PATTERN, "[REDACTED]")
+		.trim();
+	if (!normalized) return "none captured";
+	return normalized.length > MAX_TERMINAL_ERROR_DETAIL_LENGTH
+		? `${normalized.slice(0, MAX_TERMINAL_ERROR_DETAIL_LENGTH - 1)}…`
+		: normalized;
+}
+
+function requestIdFromError(error: AssistantLike | undefined): string | undefined {
+	if (!error) return undefined;
+	for (const key of ["requestId", "request_id", "requestID"]) {
+		const value = error[key];
+		if (typeof value === "string" && value.trim()) return sanitizeTerminalErrorDetail(value);
+	}
+	return undefined;
+}
+
+/** Bounded, credential-redacted report embedded in failed subagent output. */
+export function adaptiveRetryExhaustedReport(
+	message: AssistantLike | undefined,
+	model: AdaptiveStreamOptions["model"],
+	maxRetries: number,
+): string {
+	const provider = typeof message?.provider === "string" ? message.provider : model.provider;
+	const modelId = typeof message?.model === "string" ? message.model : String(model.id ?? "unknown");
+	const status = errorStatus(message);
+	const lines = [
+		ADAPTIVE_RETRY_EXHAUSTED_CODE,
+		`provider: ${sanitizeTerminalErrorDetail(provider)}`,
+		`model: ${sanitizeTerminalErrorDetail(modelId)}`,
+		`retries: ${maxRetries}/${maxRetries}`,
+		"fallback: suppressed",
+		`status: ${status === undefined ? "unknown" : status}`,
+		`last_error: ${sanitizeTerminalErrorDetail(message)}`,
+	];
+	const requestId = requestIdFromError(message);
+	if (requestId) lines.push(`request_id: ${requestId}`);
+	return lines.join("\n");
 }
 
 export function isAdaptiveRateLimit(error: unknown): boolean {
@@ -228,6 +287,16 @@ export function isAdaptiveProviderFailure(error: unknown): boolean {
 	);
 }
 
+const EXPLICIT_QUOTA_FAILURE_PATTERN =
+	/\b(?:insufficient[_ -]?user[_ -]?quota|user quota is not enough|insufficient[_ -]?quota|quota exhausted|quota exceeded|quota depleted|credits? exhausted|balance exhausted|billing exhausted|resource[_ -]?exhausted)\b/i;
+const CJK_QUOTA_FAILURE_PATTERN = /(?:额度不足|剩余额度|余额不足|配额不足|账户额度不足)/;
+
+/** Identifies account exhaustion, distinct from generic permission/authentication failures. */
+export function isAdaptiveQuotaFailure(error: unknown): boolean {
+	const text = errorText(error);
+	return QUOTA_OR_BILLING_PATTERN.test(text) || EXPLICIT_QUOTA_FAILURE_PATTERN.test(text) || CJK_QUOTA_FAILURE_PATTERN.test(text);
+}
+
 function transientUpstreamStatus(error: unknown): number | undefined {
 	return isAdaptiveTransientUpstream(error) ? errorStatus(error) : undefined;
 }
@@ -246,14 +315,14 @@ async function releaseTicket(queue: AdaptiveProviderQueue, ticket: QueueTicket |
 	return undefined;
 }
 
-function substantiveContentExists(message: AssistantLike | undefined): boolean {
+function replayUnsafeContentExists(message: AssistantLike | undefined): boolean {
 	const content = message?.content;
 	if (!Array.isArray(content)) return false;
 	return content.some(block => {
 		if (!block || typeof block !== "object") return false;
 		const item = block as Record<string, unknown>;
 		if (item.type === "text") return typeof item.text === "string" && item.text.length > 0;
-		return item.type === "toolCall" || item.type === "image";
+		return item.type === "image";
 	});
 }
 
@@ -266,6 +335,10 @@ function isReplaySafeBoundary(event: StreamEventLike): boolean {
 
 function isThinkingEvent(event: StreamEventLike): boolean {
 	return event.type === "thinking_start" || event.type === "thinking_delta" || event.type === "thinking_end";
+}
+
+function isToolCallEvent(event: StreamEventLike): boolean {
+	return /^(?:toolcall|tool_call)_(?:start|delta|end)$/.test(event.type);
 }
 
 function isSubstantiveOutputEvent(event: StreamEventLike): boolean {
@@ -303,16 +376,19 @@ function stoppedAfterRetryBudget(
 	model: AdaptiveStreamOptions["model"],
 	maxRetries: number,
 ): AssistantLike {
-	const { errorId: _errorId, errorStatus: _errorStatus, ...envelope } = message ?? {};
+	const { errorId: _errorId, errorStatus: _errorStatus, errorMessage: _errorMessage, ...envelope } = message ?? {};
 	return {
 		...envelope,
 		role: "assistant",
 		api: typeof envelope.api === "string" ? envelope.api : String(model.api ?? "openai-responses"),
 		provider: typeof envelope.provider === "string" ? envelope.provider : model.provider,
 		model: typeof envelope.model === "string" ? envelope.model : String(model.id ?? "unknown"),
-		content: [],
+		content: [{ type: "text", text: adaptiveRetryExhaustedReport(message, model, maxRetries) }],
 		usage: envelope.usage ?? emptyUsage(),
-		stopReason: "aborted",
+		// Keep this as an error so OMP's task executor forwards errorMessage to
+		// the parent. The Abort bit below prevents OMP's own recovery/fallback.
+		errorId: ADAPTIVE_TERMINAL_ABORT_ERROR_ID,
+		stopReason: "error",
 		errorMessage: adaptiveRetryStopMessage(maxRetries),
 		timestamp: Date.now(),
 	};
@@ -325,7 +401,8 @@ function stoppedAfterRetryBudgetEvent(
 ): StreamEventLike {
 	return {
 		type: "error",
-		reason: "aborted",
+		reason: "error",
+		adaptiveRetry: { code: ADAPTIVE_RETRY_EXHAUSTED_CODE, fallback: "suppressed", maxRetries },
 		error: stoppedAfterRetryBudget(message, model, maxRetries),
 	};
 }
@@ -422,6 +499,9 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 			? false
 			: (options.sharedRetryRecovery ?? false);
 	const stopAfterRetryExhaustion = transientUpstream5xxMode === "retry-stop";
+	const forwardQuotaToFallback = options.forwardQuotaToFallback === true;
+	const shouldForwardQuotaFailure = (error: unknown): boolean =>
+		forwardQuotaToFallback && isAdaptiveQuotaFailure(error);
 	void (async () => {
 		let ticket: QueueTicket | undefined;
 		let bypassedRetryState: LaneRetryState | undefined;
@@ -573,6 +653,8 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				}
 
 				const replaySafeEvents: StreamEventLike[] = [];
+				const deferredToolCallEvents: StreamEventLike[] = [];
+				let deferringToolCall = false;
 				let replayUnsafe = false;
 				let hasSubstantiveOutput = false;
 				let retry = false;
@@ -594,6 +676,10 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				const flushReplaySafeEvents = () => {
 					for (const event of replaySafeEvents) pushEvent(event);
 					replaySafeEvents.length = 0;
+				};
+				const flushDeferredToolCallEvents = () => {
+					for (const event of deferredToolCallEvents) pushEvent(event);
+					deferredToolCallEvents.length = 0;
 				};
 				const retryKind = (error: unknown): RetryProgressKind | undefined => {
 					if (isAdaptiveRateLimit(error)) return "rate-limit";
@@ -875,6 +961,15 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							replaySafeEvents.push(event);
 							continue;
 						}
+						if (isToolCallEvent(event)) {
+							deferringToolCall = true;
+							deferredToolCallEvents.push(event);
+							continue;
+						}
+						if (deferringToolCall && event.type !== "done" && event.type !== "error") {
+							deferredToolCallEvents.push(event);
+							continue;
+						}
 
 						const cancelled = event.type === "error" && isCancellation(event.error, signal);
 						const kind = retryKind(event.error);
@@ -882,11 +977,17 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							event.type === "error" &&
 							!cancelled &&
 							!hasSubstantiveOutput &&
-							!substantiveContentExists(event.error) &&
+							!replayUnsafeContentExists(event.error) &&
 							kind !== undefined
 						) {
 							excludeAttemptEndpoint(event.error);
 							lastRetryableFailure = event.error;
+							if (shouldForwardQuotaFailure(event.error)) {
+								flushReplaySafeEvents();
+								ticket = await releaseTicket(options.queue, ticket);
+								pushEvent(event);
+								return;
+							}
 							if (
 								transientUpstream5xxMode === "retry-5m" &&
 								isAdaptiveTransientUpstream(event.error)
@@ -914,12 +1015,27 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							pushEvent(event);
 							return;
 						}
+						if (
+							event.type === "error" &&
+							!cancelled &&
+							kind !== undefined &&
+							(hasSubstantiveOutput || replayUnsafeContentExists(event.error))
+						) {
+							options.logger?.warn?.("adaptive provider queue did not replay a partial retryable stream", {
+								provider: options.model.provider,
+								model: options.model.id,
+								kind,
+								hasSubstantiveOutput,
+								errorContentBlocks: Array.isArray(event.error?.content) ? event.error.content.length : 0,
+							});
+						}
 
 						flushReplaySafeEvents();
+						flushDeferredToolCallEvents();
 						replayUnsafe = event.type !== "error";
 						const eventHasSubstantiveOutput = isSubstantiveOutputEvent(event);
 						hasSubstantiveOutput ||= eventHasSubstantiveOutput;
-						if (eventHasSubstantiveOutput || substantiveContentExists(event.error)) {
+						if (eventHasSubstantiveOutput || replayUnsafeContentExists(event.error)) {
 							disableAttemptDeadline();
 							await clearObservedRetryState();
 							ticket = await releaseTicket(options.queue, ticket);
@@ -962,11 +1078,16 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 					if (
 						!cancelled &&
 						!hasSubstantiveOutput &&
-						!substantiveContentExists(error && typeof error === "object" ? (error as AssistantLike) : undefined) &&
+						!replayUnsafeContentExists(error && typeof error === "object" ? (error as AssistantLike) : undefined) &&
 						kind !== undefined
 					) {
 						excludeAttemptEndpoint(error);
 						lastRetryableFailure = error && typeof error === "object" ? (error as AssistantLike) : undefined;
+						if (shouldForwardQuotaFailure(error)) {
+							flushReplaySafeEvents();
+							ticket = await releaseTicket(options.queue, ticket);
+							throw error;
+						}
 						if (
 							transientUpstream5xxMode === "retry-5m" &&
 							isAdaptiveTransientUpstream(error)
@@ -982,8 +1103,25 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 							return;
 						}
 					}
+					if (
+						!cancelled &&
+						kind !== undefined &&
+						(hasSubstantiveOutput || replayUnsafeContentExists(error && typeof error === "object" ? (error as AssistantLike) : undefined))
+					) {
+						options.logger?.warn?.("adaptive provider queue did not replay a partial retryable stream", {
+							provider: options.model.provider,
+							model: options.model.id,
+							kind,
+							hasSubstantiveOutput,
+							errorContentBlocks:
+								error && typeof error === "object" && Array.isArray((error as AssistantLike).content)
+									? (error as AssistantLike).content?.length ?? 0
+									: 0,
+						});
+					}
 					if (signal?.aborted) throw cancellationError();
 					flushReplaySafeEvents();
+					flushDeferredToolCallEvents();
 					if (!hasSubstantiveOutput && !cancelled && ticket && !bypassesUpstreamRetry(error)) {
 						await options.queue.markRetryStateExhausted(ticket);
 					}

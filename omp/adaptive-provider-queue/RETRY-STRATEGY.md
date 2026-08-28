@@ -1,6 +1,6 @@
 # OMP Provider Retry And Fallback Strategy
 
-记录日期：2026-08-19。当前验证版本：OMP 17.3.5。
+记录日期：2026-08-23。当前验证版本：OMP 18.0.0。
 
 ## 当前架构
 
@@ -67,7 +67,7 @@ score   = latency + 1.5 * jitter
 - 路由状态目录不可创建、锁暂时不可用或状态文件不可写时 fail-open 到缓存/配置 URL，
   不会因为遥测故障触发模型 fallback。
 
-错误全部由 Universal Retry 判断。transport failure 或普通 `502/503/504` 会把本次
+错误全部由 Universal Retry 判断。transport failure 或普通 `502/503/504/524` 会把本次
 attempt 使用的地址加入 request-local 排除集合；下一次 attempt 再让 Router 从剩余地址
 按 score 选择。`429`、鉴权、额度和模型错误不排除地址。三个地址都被排除后，Retry
 清空集合并开始下一轮。Router 不等待退避、不重试请求、不触发 fallback。
@@ -146,17 +146,25 @@ retry:
 |---|---|
 | `429`、concurrency、rate limit | 本地 50 次预算 |
 | 明确 `server_is_overloaded` 或服务器 overloaded 文案，包括 HTTP 500 | 本地 50 次预算 |
-| 普通 `502/503/504` | 本地 50 次预算 |
+| 普通 `502/503/504/524` | 本地 50 次预算 |
 | `stream_read_error`、timeout、socket/fetch/network failure、`Unable to connect`、不完整流 | 本地 50 次预算 |
 | `401/402/403`、token revoked/invalid、权限或付款错误 | 本地 50 次预算 |
-| quota、billing、credit、balance exhausted | 本地 50 次预算 |
+| quota、billing、credit、balance exhausted | 普通 provider 本地 50 次；AgentRouter 明确额度耗尽立即交给 OMP fallback |
 | 明确 model/capacity/route unavailable | 本地 50 次预算 |
 | 未分类的普通请求错误，例如一般 `400` 参数错误 | 直接返回 OMP，由 OMP 决定是否 fallback |
 | 已经产生正文/tool/image 后的错误 | 不重放，直接结束当前流 |
 
-默认 `retry-stop` 下，表中受管理错误耗尽预算后返回明确的 aborted 终态，OMP 不会
-遍历 fallback chain。它不会把永久鉴权或额度错误误判为一定能够自行恢复；这是当前
+默认 `retry-stop` 下，表中受管理错误耗尽预算后返回明确的 terminal error 终态，OMP 不会
+遍历 fallback chain。子 agent 的 task result 会保留 `ADAPTIVE_RETRY_EXHAUSTED`、provider、
+model、status 和脱敏的最后错误；这让主 agent 能区分“重试耗尽”与“用户取消”，同时不触发
+OMP 的第二层 fallback。它不会把永久鉴权或额度错误误判为一定能够自行恢复；这是当前
 策略为了避免敏感切换账号而作出的明确取舍，用户仍可 Esc 停止。
+
+AgentRouter 账号池是例外：如果错误明确包含 `insufficient_user_quota`、`user quota is
+not enough` 或同等 quota/billing exhaustion 信号，Universal Retry 不消耗本地 50 次预算，
+而是立即把最终错误交给 OMP。配置中的 `agentrouter/* -> agentrouter-2/* ->
+agentrouter-3/*` 随后负责换账号；普通 `401/403`、token revoked 和一般限流仍按上表的
+本地策略处理。
 
 ## Session 命令
 
@@ -172,9 +180,9 @@ retry:
 
 - `retry-stop`：默认。所有受管理错误本地重试最多 50 次，耗尽后停止当前 turn。
 - `retry`：受管理错误重试最多 50 次，耗尽后把最终原始错误交给 OMP fallback。
-- `retry-5m`：普通 `502/503/504` 在当前 provider 上最多重试五分钟，到期后 fallback；
+- `retry-5m`：普通 `502/503/504/524` 在当前 provider 上最多重试五分钟，到期后 fallback；
   其他受管理错误仍执行 50 次策略。
-- `fallback`：普通 `502/503/504` 首次失败即交给 OMP fallback；其他受管理错误仍执行
+- `fallback`：普通 `502/503/504/524` 首次失败即交给 OMP fallback；其他受管理错误仍执行
   50 次策略。
 - `toggle` 顺序为 `retry -> retry-stop -> retry-5m -> fallback -> retry`。
 
@@ -216,6 +224,11 @@ retry:
       - aiinput/gpt-5.6-sol:max
     tokenking-grok/*:
       - aiinput/gpt-5.6-sol:max
+    justworker/*:
+      - justworker-2/*
+      - justworker-3/*
+    justworker-2/*:
+      - justworker-3/*
 ```
 
 fallback provider 也会经过 universal retry wrapper，并从自己的 policy budget 开始。

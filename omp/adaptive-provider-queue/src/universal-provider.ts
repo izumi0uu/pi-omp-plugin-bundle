@@ -3,6 +3,13 @@ import type { Api } from "@oh-my-pi/pi-ai";
 export const ADAPTIVE_RETRY_API = "adaptive-universal-provider-retry" as Api;
 
 const ORIGINAL_API = Symbol.for("omp.adaptive-provider-queue.original-api.v1");
+const AGENTROUTER_ORIGIN = "https://agentrouter.org";
+const AGENTROUTER_CODEX_USER_AGENT = "codex_cli_rs/0.1.0";
+const AGENTROUTER_CODEX_RESPONSE_PATHS = new Set([
+	"/codex/responses",
+	"/v1/codex/responses",
+]);
+const AGENTROUTER_RESPONSES_BASE_URL = `${AGENTROUTER_ORIGIN}/v1`;
 
 interface MutableModel {
 	provider: string;
@@ -17,6 +24,16 @@ interface ProviderRequestOptions {
 	betas?: string | string[];
 	fetch?: typeof globalThis.fetch;
 	[key: string]: unknown;
+}
+
+/** AgentRouter account aliases share the same wire protocol but use separate credentials. */
+export function isAgentRouterProvider(provider: string): boolean {
+	return /^agentrouter(?:-\d+)?$/.test(provider);
+}
+
+/** Providers whose numbered aliases represent independent accounts for quota fallback. */
+export function isQuotaFallbackProvider(provider: string): boolean {
+	return isAgentRouterProvider(provider) || /^justworker(?:-\d+)?$/.test(provider);
 }
 
 export interface ModelRegistryLike {
@@ -66,11 +83,79 @@ function anthropicBetaFetch(
 	};
 }
 
-/** Bridges configured Anthropic beta headers into the final provider request. */
+function agentRouterCodexResponsesFetch(baseFetch: typeof globalThis.fetch): typeof globalThis.fetch {
+	return async (input, init) => {
+		const url = new URL(input instanceof Request ? input.url : input);
+		const isCodexPath = AGENTROUTER_CODEX_RESPONSE_PATHS.has(url.pathname);
+		if (url.origin !== AGENTROUTER_ORIGIN || (!isCodexPath && url.pathname !== "/v1/responses")) {
+			return baseFetch(input, init);
+		}
+
+		if (isCodexPath) url.pathname = "/v1/responses";
+		const originalHeaders = input instanceof Request ? input.headers : undefined;
+		const headers = new Headers(originalHeaders);
+		const overrideHeaders = new Headers(init?.headers);
+		overrideHeaders.forEach((value, name) => headers.set(name, value));
+		headers.set("user-agent", AGENTROUTER_CODEX_USER_AGENT);
+		if (input instanceof Request) {
+			return baseFetch(new Request(url, input), { ...init, headers });
+		}
+		return baseFetch(url, { ...init, headers });
+	};
+}
+
+function isAgentRouterOrigin(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	try {
+		return new URL(baseUrl).origin === AGENTROUTER_ORIGIN;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The OMP Codex transport owns its endpoint path and does not honor a
+ * request-local fetch override. Use the ordinary Responses transport for
+ * AgentRouter GPT models so the gateway receives `/v1/responses` directly.
+ */
+export function modelForProviderRequest<T extends MutableModel>(model: T): T {
+	if (
+		!isAgentRouterProvider(model.provider) ||
+		(model.api !== "openai-codex-responses" && model.api !== "openai-responses") ||
+		!isAgentRouterOrigin(model.baseUrl)
+	) {
+		return model;
+	}
+	return {
+		...model,
+		api: "openai-responses" as Api,
+		baseUrl: AGENTROUTER_RESPONSES_BASE_URL,
+		headers: {
+			...model.headers,
+			"user-agent": AGENTROUTER_CODEX_USER_AGENT,
+		},
+	};
+}
+
+/** Applies request-local compatibility options before the original provider transport runs. */
 export function modelRequestOptions<T extends ProviderRequestOptions | undefined>(
 	model: MutableModel,
 	options: T,
 ): T | ProviderRequestOptions {
+	if (
+		isAgentRouterProvider(model.provider) &&
+		(model.api === "openai-codex-responses" || model.api === "openai-responses") &&
+		isAgentRouterOrigin(model.baseUrl)
+	) {
+		return {
+			...options,
+			headers: {
+				...((options as ProviderRequestOptions | undefined)?.headers as Record<string, string> | undefined),
+				"user-agent": AGENTROUTER_CODEX_USER_AGENT,
+			},
+			fetch: agentRouterCodexResponsesFetch(options?.fetch ?? globalThis.fetch),
+		};
+	}
 	if (model.api !== "anthropic-messages" || !model.headers) return options ?? {};
 	const configuredBetas = Object.entries(model.headers)
 		.filter(([name]) => name.toLowerCase() === "anthropic-beta")

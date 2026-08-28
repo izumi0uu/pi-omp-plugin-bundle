@@ -17,16 +17,75 @@ import {
 import type { AdaptiveRetryProgress } from "../src/retry-progress.ts";
 import {
 	AdaptiveRetryExhaustedError,
+	ADAPTIVE_RETRY_EXHAUSTED_CODE,
+	ADAPTIVE_TERMINAL_ABORT_ERROR_ID,
+	adaptiveRetryExhaustedReport,
 	adaptiveRetryStopMessage,
 	createAdaptiveStream,
+	isAdaptiveQuotaFailure,
 	isAdaptiveProviderFailure,
 	isAdaptiveRateLimit,
 	isAdaptiveTransientTransport,
 	isAdaptiveTransientUpstream,
 	retryAfterMsFromError,
 } from "../src/stream-wrapper.ts";
+import {
+	findProviderConfigReferences,
+	parseProviderConfigCommand,
+	removeProviderConfig,
+} from "../src/provider-config.ts";
 
 const tempDirs: string[] = [];
+
+test("provider removal command parses safe provider and model targets", () => {
+	assert.deepEqual(parseProviderConfigCommand("list"), { action: "list" });
+	assert.deepEqual(parseProviderConfigCommand("aiinput/gpt-5.6-sol --dry-run"), {
+		action: "model", provider: "aiinput", model: "gpt-5.6-sol", yes: false, force: false, dryRun: true,
+	});
+	assert.deepEqual(parseProviderConfigCommand("provider justworker --yes --force"), {
+		action: "provider", provider: "justworker", yes: true, force: true, dryRun: false,
+	});
+	assert.deepEqual(parseProviderConfigCommand(""), { action: "list" });
+});
+
+test("provider config removal edits only the selected model and creates a backup", async () => {
+	const root = await tempRoot();
+	const models = [
+		"providers:",
+		"  alpha:",
+		"    baseUrl: https://alpha.test/v1",
+		"    models:",
+		"      - id: one",
+		"        name: One",
+		"      - id: two",
+		"        name: Two",
+		"  beta:",
+		"    baseUrl: https://beta.test/v1",
+		"",
+	].join("\n");
+	await fs.mkdir(root, { recursive: true });
+	await fs.writeFile(path.join(root, "models.yml"), models, "utf8");
+	const result = await removeProviderConfig({ kind: "model", provider: "alpha", model: "one", yes: true }, { PI_CODING_AGENT_DIR: root });
+	assert.equal(result.removed, "alpha/one");
+	assert.ok(result.backupPath);
+	const next = await fs.readFile(path.join(root, "models.yml"), "utf8");
+	assert.doesNotMatch(next, /id: one/);
+	assert.match(next, /id: two/);
+	assert.match(next, /^  beta:/m);
+	assert.equal((await fs.stat(result.backupPath!)).mode & 0o777, 0o600);
+});
+
+test("provider removal blocks references unless forced", async () => {
+	const root = await tempRoot();
+	await fs.mkdir(root, { recursive: true });
+	await fs.writeFile(path.join(root, "models.yml"), "providers:\n  alpha:\n    models:\n      - id: one\n", "utf8");
+	await fs.writeFile(path.join(root, "config.yml"), "modelRoles:\n  default: alpha/one\n", "utf8");
+	await assert.rejects(
+		removeProviderConfig({ kind: "provider", provider: "alpha", yes: true }, { PI_CODING_AGENT_DIR: root }),
+		/referenced/,
+	);
+	assert.deepEqual(findProviderConfigReferences("default: alpha/one:max\n", { provider: "alpha", model: "one" }), ["default: alpha/one:max"]);
+});
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -90,6 +149,7 @@ test("transient concurrency limits remain distinct from provider-account failure
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "Our servers are currently overloaded. Please try again later." }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 502, errorMessage: "server_is_overloaded" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 504, errorMessage: "server_is_overloaded" }), true);
+	assert.equal(isAdaptiveRateLimit({ errorStatus: 524, errorMessage: "server_is_overloaded" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 502, errorMessage: "Concurrency limit exceeded for account" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 503, errorMessage: "rate limit exceeded" }), true);
 	assert.equal(isAdaptiveRateLimit({ errorStatus: 504, errorMessage: "Too many pending requests" }), true);
@@ -155,18 +215,47 @@ test("authentication, quota, billing and explicit model failures enter the provi
 	}
 });
 
+test("quota classification stays narrower than generic provider failures", () => {
+	for (const error of [
+		{ errorStatus: 403, errorMessage: "insufficient_user_quota: user quota is not enough" },
+		{ errorStatus: 429, errorMessage: "insufficient_quota" },
+		{ errorMessage: "billing balance exhausted" },
+		{ errorMessage: "resource_exhausted" },
+		{ errorStatus: 403, errorMessage: "用户额度不足, 剩余额度: $-0.65" },
+	]) {
+		assert.equal(isAdaptiveQuotaFailure(error), true);
+	}
+	for (const error of [
+		{ errorStatus: 403, errorMessage: "Forbidden" },
+		{ errorStatus: 401, errorMessage: "OAuth access token has been revoked" },
+		{ errorMessage: "Codex stream ended before terminal completion event" },
+	]) {
+		assert.equal(isAdaptiveQuotaFailure(error), false);
+	}
+});
+
 test("transport and generic upstream errors use distinct adaptive retry classes", () => {
 	assert.equal(isAdaptiveTransientTransport({ errorMessage: "Error Code stream_read_error: stream_read_error" }), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("socket connection was closed unexpectedly")), true);
+	assert.equal(
+		isAdaptiveTransientTransport(
+			new Error(
+				"Tool call was not executed because the provider stream ended with an error before the tool could run: The socket connection was closed unexpectedly",
+			),
+		),
+		true,
+	);
 	assert.equal(
 		isAdaptiveTransientTransport(new Error("Unable to connect. Is the computer able to access the url?")),
 		true,
 	);
 	assert.equal(isAdaptiveTransientTransport(new Error("OpenAI responses stream timed out while waiting for the first event")), true);
 	assert.equal(isAdaptiveTransientTransport(new Error("responses stream ended without response.completed: missing_terminal")), true);
+	assert.equal(isAdaptiveTransientTransport(new Error("Anthropic stream envelope error: stream ended before message_stop")), true);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "Bad gateway" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 504, errorMessage: "Gateway timeout" }), false);
+	assert.equal(isAdaptiveTransientTransport({ errorStatus: 524, errorMessage: "524 status code (no body)" }), false);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 503, errorMessage: "stream_read_error" }), true);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 502, errorMessage: "socket connection was closed unexpectedly" }), true);
 	assert.equal(isAdaptiveTransientTransport({ errorStatus: 500, errorMessage: "Internal server error" }), false);
@@ -175,6 +264,7 @@ test("transport and generic upstream errors use distinct adaptive retry classes"
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 502, errorMessage: "Bad gateway" }), true);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }), true);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 504, errorMessage: "Gateway timeout" }), true);
+	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 524, errorMessage: "524 status code (no body)" }), true);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 503, errorMessage: "stream_read_error" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 502, errorMessage: "socket connection was closed unexpectedly" }), false);
 	assert.equal(isAdaptiveTransientUpstream({ errorStatus: 500, errorMessage: "Internal server error" }), false);
@@ -769,12 +859,18 @@ async function runRoutedRetry(
 	}
 }
 
-test("transport and generic 502/503/504 failures exclude the current URL before retrying", async () => {
+test("transport and generic 502/503/504/524 failures exclude the current URL before retrying", async () => {
 	for (const failure of [
-		{ kind: "event", error: new Error("socket connection was closed unexpectedly") },
+		{
+			kind: "event",
+			error: new Error(
+				"Tool call was not executed because the provider stream ended with an error before the tool could run: The socket connection was closed unexpectedly",
+			),
+		},
 		{ kind: "event", error: assistant({ errorStatus: 502, errorMessage: "Bad gateway" }) },
 		{ kind: "event", error: assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" }) },
 		{ kind: "throw", error: assistant({ errorStatus: 504, errorMessage: "Gateway timeout" }) },
+		{ kind: "event", error: assistant({ errorStatus: 524, errorMessage: "524 status code (no body)" }) },
 		{ kind: "throw", error: new Error("fetch failed: ECONNRESET") },
 	] satisfies readonly RoutedFailure[]) {
 		const { observations, rankedBaseUrls } = await runRoutedRetry([failure]);
@@ -1007,7 +1103,7 @@ test("isolated retries forward the final error after the local budget", async ()
 	assert.equal(progress.at(-1), undefined);
 });
 
-test("retry-stop ends with a sanitized aborted message after the local retry budget", async () => {
+test("retry-stop reports a structured terminal error after the local retry budget", async () => {
 	const rootDir = await tempRoot();
 	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
 	const sharedCalls = rejectSharedRetryCalls(queue);
@@ -1041,15 +1137,20 @@ test("retry-stop ends with a sanitized aborted message after the local retry bud
 	assert.equal(attempts, 3);
 	assert.deepEqual(output.events.map(event => event.type), ["error"]);
 	const stopped = output.events[0];
-	assert.equal(stopped.reason, "aborted");
-	assert.equal(stopped.error.stopReason, "aborted");
+	assert.equal(stopped.reason, "error");
+	assert.equal(stopped.error.stopReason, "error");
 	assert.equal(stopped.error.errorMessage, adaptiveRetryStopMessage(2));
+	assert.equal(stopped.error.errorId, ADAPTIVE_TERMINAL_ABORT_ERROR_ID);
+	assert.equal(stopped.error.errorMessage.startsWith(ADAPTIVE_RETRY_EXHAUSTED_CODE), true);
 	assert.equal(stopped.error.provider, "primary");
 	assert.equal(stopped.error.model, "model");
-	assert.deepEqual(stopped.error.content, []);
+	assert.equal(stopped.error.content.length, 1);
+	assert.match(stopped.error.content[0].text, /provider: primary/);
+	assert.match(stopped.error.content[0].text, /status: 503/);
+	assert.match(stopped.error.content[0].text, /last_error: Service temporarily unavailable/);
 	assert.deepEqual(stopped.error.usage, { input: 7, output: 0 });
 	assert.equal("errorStatus" in stopped.error, false);
-	assert.equal("errorId" in stopped.error, false);
+	assert.equal(stopped.adaptiveRetry.code, ADAPTIVE_RETRY_EXHAUSTED_CODE);
 });
 
 test("retry-stop also suppresses fallback when a retryable failure is thrown", async () => {
@@ -1072,9 +1173,9 @@ test("retry-stop also suppresses fallback when a retryable failure is thrown", a
 
 	await output.completion.promise;
 	assert.equal(attempts, 2);
-	assert.equal(output.events[0].reason, "aborted");
+	assert.equal(output.events[0].reason, "error");
 	assert.equal(output.events[0].error.errorMessage, adaptiveRetryStopMessage(1));
-	assert.equal(output.events[0].error.stopReason, "aborted");
+	assert.equal(output.events[0].error.stopReason, "error");
 });
 
 test("retry-stop retries OMP's normalized unable-to-connect stream error", async () => {
@@ -1098,7 +1199,7 @@ test("retry-stop retries OMP's normalized unable-to-connect stream error", async
 	await output.completion.promise;
 	assert.equal(attempts, 2);
 	assert.equal(output.events.length, 1);
-	assert.equal(output.events[0].reason, "aborted");
+	assert.equal(output.events[0].reason, "error");
 	assert.equal(output.events[0].error.errorMessage, adaptiveRetryStopMessage(1));
 });
 
@@ -1175,9 +1276,56 @@ test("retry-stop retries authentication failures and stops without fallback afte
 
 	await output.completion.promise;
 	assert.equal(attempts, 3);
-	assert.equal(output.events.at(-1).error.stopReason, "aborted");
+	assert.equal(output.events.at(-1).error.stopReason, "error");
 	assert.equal(output.events.at(-1).error.errorMessage, adaptiveRetryStopMessage(2));
-	assert.equal(output.events.at(-1).reason, "aborted");
+	assert.equal(output.events.at(-1).reason, "error");
+});
+
+test("account-provider quota failures forward to OMP fallback immediately", async () => {
+	for (const provider of ["agentrouter", "agentrouter-2", "agentrouter-3", "justworker", "justworker-2", "justworker-3"]) {
+		const rootDir = await tempRoot();
+		const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 0, maxDelayMs: 0 });
+		const quotaFailure = assistant({
+			errorStatus: 403,
+			errorMessage: "user quota is not enough (insufficient_user_quota)",
+		});
+		let attempts = 0;
+		const output = createAdaptiveStream({
+			model: { provider, id: "gpt-5.6-sol", baseUrl: "https://agentrouter.org" },
+			requestOptions: { apiKey: "test" },
+			queue,
+			maxRetries: 50,
+			transientUpstream5xxMode: "retry-stop",
+			forwardQuotaToFallback: true,
+			createOutputStream: () => new FakeOutputStream(),
+			createInputStream: () => {
+				attempts += 1;
+				return new FakeInputStream([{ type: "error", reason: "error", error: quotaFailure }]);
+			},
+		});
+
+		await output.completion.promise;
+		assert.equal(attempts, 1, provider);
+		assert.equal(output.events.at(-1).error, quotaFailure, provider);
+		assert.equal(output.events.at(-1).reason, "error", provider);
+	}
+});
+
+test("terminal retry report redacts credentials and bounds provider details", () => {
+	const report = adaptiveRetryExhaustedReport(
+		{
+			provider: "primary",
+			model: "model",
+			errorStatus: 503,
+			errorMessage: `Bearer sk-secret-token-1234567890 ${"x".repeat(2000)}`,
+		},
+		{ provider: "primary", id: "model" },
+		50,
+	);
+	assert.match(report, /ADAPTIVE_RETRY_EXHAUSTED/);
+	assert.match(report, /\[REDACTED\]/);
+	assert.doesNotMatch(report, /sk-secret-token/);
+	assert.ok(report.length < 1_200);
 });
 
 test("retry mode forwards quota failures only after the retry budget is exhausted", async () => {
@@ -1445,11 +1593,11 @@ test("a generic 503 uses adaptive retry by default", async () => {
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 });
 
-test("retry-5m retries generic 5xx only until its wall-clock window expires", async () => {
+test("retry-5m retries a generic 524 only until its wall-clock window expires", async () => {
 	const rootDir = await tempRoot();
 	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, baseDelayMs: 30, maxDelayMs: 30, random: () => 0 });
 	const sharedCalls = rejectSharedRetryCalls(queue);
-	const unavailable = assistant({ errorStatus: 503, errorMessage: "Service temporarily unavailable" });
+	const unavailable = assistant({ errorStatus: 524, errorMessage: "524 status code (no body)" });
 	let upstreamCalls = 0;
 	let clockMs = 0;
 	const sleeps: number[] = [];
@@ -2341,15 +2489,124 @@ test("explicit server overload retries instead of reaching fallback", async () =
 	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
 });
 
+test("stream wrapper retries an Anthropic envelope drop before message_stop", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = new Error("Anthropic stream envelope error: stream ended before message_stop");
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "recovered" }] });
+	let attempts = 0;
+	const output = createAdaptiveStream({
+		model: { provider: "agentrouter", id: "claude-opus-5", baseUrl: "https://agentrouter.org" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		retryTransientUpstream5xx: false,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => {
+			attempts += 1;
+			if (attempts === 1) throw failed;
+			return new FakeInputStream([
+				{ type: "start", partial: succeeded },
+				{ type: "text_delta", contentIndex: 0, delta: "recovered", partial: succeeded },
+				{ type: "done", reason: "stop", message: succeeded },
+			]);
+		},
+	});
+	await output.completion.promise;
+	assert.equal(attempts, 2);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+});
+
+test("stream wrapper retries a transport drop after buffering an unexecuted tool call", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const failed = assistant({
+		provider: "justworker",
+		model: "claude-opus-5",
+		errorMessage: "The socket connection was closed unexpectedly",
+		content: [
+			{ type: "thinking", thinking: "delegate" },
+			{ type: "toolCall", id: "failed-task", name: "task", arguments: { prompt: "research" } },
+		],
+	});
+	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "recovered" }] });
+	const attempts = [
+		new FakeInputStream([
+			{ type: "start", partial: assistant() },
+			{ type: "toolcall_start", contentIndex: 1, id: "failed-task", name: "task", partial: failed },
+			{ type: "toolcall_delta", contentIndex: 1, delta: '{"prompt":"research"}', partial: failed },
+			{ type: "toolcall_end", contentIndex: 1, partial: failed },
+			{ type: "error", reason: "error", error: failed },
+		]),
+		new FakeInputStream([
+			{ type: "start", partial: succeeded },
+			{ type: "text_delta", contentIndex: 0, delta: "recovered", partial: succeeded },
+			{ type: "done", reason: "stop", message: succeeded },
+		]),
+	];
+	const output = createAdaptiveStream({
+		model: { provider: "justworker", id: "claude-opus-5", baseUrl: "https://api.justwoker.icu/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		maxRetries: 1,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () => attempts.shift()!,
+	});
+
+	await output.completion.promise;
+	assert.equal(attempts.length, 0);
+	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+	assert.equal(output.events.some(event => event.id === "failed-task"), false);
+});
+
+test("stream wrapper commits buffered tool calls only when the provider stream completes", async () => {
+	const rootDir = await tempRoot();
+	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
+	const completed = assistant({
+		stopReason: "toolUse",
+		content: [{ type: "toolCall", id: "task-1", name: "task", arguments: { prompt: "research" } }],
+	});
+	const output = createAdaptiveStream({
+		model: { provider: "justworker", id: "claude-opus-5", baseUrl: "https://api.justwoker.icu/v1" },
+		requestOptions: { apiKey: "test" },
+		queue,
+		createOutputStream: () => new FakeOutputStream(),
+		createInputStream: () =>
+			new FakeInputStream([
+				{ type: "start", partial: completed },
+				{ type: "toolcall_start", contentIndex: 0, id: "task-1", name: "task", partial: completed },
+				{ type: "toolcall_delta", contentIndex: 0, delta: '{"prompt":"research"}', partial: completed },
+				{ type: "toolcall_end", contentIndex: 0, partial: completed },
+				{ type: "done", reason: "toolUse", message: completed },
+			]),
+	});
+
+	await output.completion.promise;
+	assert.deepEqual(output.events.map(event => event.type), [
+		"start",
+		"toolcall_start",
+		"toolcall_delta",
+		"toolcall_end",
+		"done",
+	]);
+});
+
 test("stream wrapper does not replay a transport drop after substantive text", async () => {
 	const rootDir = await tempRoot();
 	const queue = new AdaptiveProviderQueue({ rootDir, pollMs: 10, staleMs: 2_000, baseDelayMs: 0, maxDelayMs: 0 });
-	const failed = assistant({ errorMessage: "Error Code stream_read_error: stream_read_error" });
+	const failed = assistant({
+		provider: "agentrouter-2",
+		model: "claude-opus-5",
+		errorMessage: "Anthropic stream envelope error: stream ended before message_stop",
+		content: [{ type: "text", text: "partial" }],
+	});
 	let attempts = 0;
+	const warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
 	const output = createAdaptiveStream({
-		model: { provider: "primary", id: "model", baseUrl: "https://example.test/v1" },
+		model: { provider: "agentrouter-2", id: "claude-opus-5", baseUrl: "https://agentrouter.org" },
 		requestOptions: { apiKey: "test" },
 		queue,
+		logger: { warn: (message, fields) => warnings.push({ message, fields }) },
 		createOutputStream: () => new FakeOutputStream(),
 		createInputStream: () => {
 			attempts += 1;
@@ -2363,6 +2620,16 @@ test("stream wrapper does not replay a transport drop after substantive text", a
 	await output.completion.promise;
 	assert.equal(attempts, 1);
 	assert.equal(output.events.at(-1).error, failed);
+	assert.deepEqual(
+		warnings.find(entry => entry.message === "adaptive provider queue did not replay a partial retryable stream")?.fields,
+		{
+			provider: "agentrouter-2",
+			model: "claude-opus-5",
+			kind: "transport",
+			hasSubstantiveOutput: true,
+			errorContentBlocks: 1,
+		},
+	);
 });
 
 test("stream wrapper never replays a rate limit after substantive content", async () => {

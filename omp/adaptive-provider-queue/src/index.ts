@@ -46,10 +46,18 @@ import {
 } from "./stream-wrapper.ts";
 import {
 	ADAPTIVE_RETRY_API,
+	isQuotaFallbackProvider,
+	modelForProviderRequest,
 	modelRequestOptions,
 	UniversalProviderRetry,
 	type ModelRegistryLike,
 } from "./universal-provider.ts";
+import {
+	findProviderConfigReferences,
+	parseProviderConfigCommand,
+	readProviderConfig,
+	removeProviderConfig,
+} from "./provider-config.ts";
 
 const queue = new AdaptiveProviderQueue({
 	baseDelayMs: 500,
@@ -61,7 +69,12 @@ const retryStatuses = sharedRetryStatusController();
 export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 	type SessionContextLike = {
 		hasUI: boolean;
-		ui: { setStatus(key: string, text: string | undefined): void };
+		ui: {
+			setStatus(key: string, text: string | undefined): void;
+			notify(message: string, level?: "info" | "warning" | "error"): void;
+			select?(title: string, options: Array<{ label: string; description?: string }>): Promise<string | undefined>;
+			confirm?(title: string, message: string): Promise<boolean>;
+		};
 		modelRegistry: ModelRegistryLike & {
 			resolver?(model: unknown, sessionId?: string): unknown | Promise<unknown>;
 		};
@@ -188,8 +201,8 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 					: mode === "retry-stop"
 						? "Managed provider errors will retry up to 50 times, then stop this turn without OMP fallback."
 						: mode === "retry-5m"
-							? "Generic 502/503/504 errors will retry on the current provider for up to 5 minutes, then enter OMP fallback. Press Esc to cancel."
-							: "Generic 502/503/504 errors will immediately enter OMP fallback in this session.",
+							? "Generic 502/503/504/524 errors will retry on the current provider for up to 5 minutes, then enter OMP fallback. Press Esc to cancel."
+							: "Generic 502/503/504/524 errors will immediately enter OMP fallback in this session.",
 				"info",
 			);
 		},
@@ -284,6 +297,113 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 			}
 		},
 	});
+	const providerCommand = async (args: string, ctx: SessionContextLike): Promise<void> => {
+		let command = parseProviderConfigCommand(args);
+		if (command?.action === "list" && args.trim().length === 0 && ctx.hasUI && ctx.ui.select) {
+			const inspected = await readProviderConfig();
+			const providerChoice = await ctx.ui.select(
+				"Provider to remove",
+				inspected.providers.map(provider => ({
+					label: provider.name,
+					description: provider.models.length > 0
+						? `${provider.models.length} model${provider.models.length === 1 ? "" : "s"}`
+						: "no static models",
+				})),
+			);
+			if (!providerChoice) return;
+			const provider = inspected.providers.find(entry => entry.name === providerChoice);
+			if (!provider) return;
+			const actionChoice = await ctx.ui.select("Delete from provider", [
+				{ label: "Delete one model", description: "Keep the provider and its other models" },
+				{ label: "Delete entire provider", description: "Remove the provider block from models.yml" },
+			]);
+			if (!actionChoice) return;
+			if (actionChoice === "Delete one model") {
+				if (provider.models.length === 0) {
+					ctx.ui.notify(`${provider.name} has no statically configured models.`, "warning");
+					return;
+				}
+				const modelChoice = await ctx.ui.select(
+					`Model in ${provider.name}`,
+					provider.models.map(model => ({ label: model })),
+				);
+				if (!modelChoice) return;
+				command = { action: "model", provider: provider.name, model: modelChoice, yes: false, force: false, dryRun: false };
+			} else {
+				command = { action: "provider", provider: provider.name, yes: false, force: false, dryRun: false };
+			}
+		}
+		if (!command) {
+			ctx.ui.notify(
+				"Usage: /provider-remove [list|<provider>|<provider>/<model>] [--yes] [--force] [--dry-run]",
+				"warning",
+			);
+			return;
+		}
+		try {
+			const inspected = await readProviderConfig();
+			if (command.action === "list") {
+				const lines = inspected.providers.map(provider =>
+					`${provider.name}${provider.models.length > 0 ? `: ${provider.models.join(", ")}` : " (no static models)"}`,
+				);
+				ctx.ui.notify(`Configured providers (${inspected.path}):\n${lines.join("\n")}`, "info");
+				return;
+			}
+			const target = command.action === "provider"
+				? command.provider
+				: `${command.provider}/${command.model}`;
+			const references = findProviderConfigReferences(inspected.text, {
+				provider: command.provider,
+				model: command.action === "model" ? command.model : undefined,
+			});
+			const scope = command.action === "provider" ? "entire provider" : "this model";
+			let approved = command.yes;
+			if (!command.dryRun && !command.yes) {
+				if (!ctx.hasUI || typeof (ctx.ui as { confirm?: unknown }).confirm !== "function") {
+					ctx.ui.notify(`Refusing to delete ${target} without --yes in a non-interactive session.`, "warning");
+					return;
+				}
+				const confirmed = await (ctx.ui as { confirm(title: string, message: string): Promise<boolean> }).confirm(
+					`Delete ${scope}?`,
+					`${target}\nThis edits ${inspected.path} and creates a timestamped backup. Existing references are not changed${references.length > 0 ? ` (${references.length} found)` : ""}.`,
+				);
+				if (!confirmed) {
+					ctx.ui.notify("Deletion cancelled.", "info");
+					return;
+				}
+				approved = true;
+			}
+			const result = await removeProviderConfig({
+				kind: command.action,
+				provider: command.provider,
+				...(command.action === "model" ? { model: command.model } : {}),
+				yes: approved,
+				force: command.force,
+				dryRun: command.dryRun,
+			});
+			const referenceNote = result.references.length > 0
+				? `\nReferences remain and may need manual cleanup:\n${result.references.slice(0, 8).map(line => `- ${line}`).join("\n")}`
+				: "";
+			if (command.dryRun) {
+				ctx.ui.notify(`Dry run: would remove ${result.removed} from ${result.path}.${referenceNote}`, "info");
+				return;
+			}
+			ctx.ui.notify(
+				`Removed ${result.removed}. Backup: ${result.backupPath}.\nRestart OMP or run /reload to refresh the model registry.${referenceNote}`,
+				"info",
+			);
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+		}
+	};
+	pi.registerCommand("provider-remove", {
+		description: "Safely remove a custom provider or one of its models from models.yml",
+		handler: providerCommand,
+	});
+	pi.registerCommand("provider-delete", {
+		description: "Alias for /provider-remove",
+		handler: providerCommand,
+	});
 	pi.on("session_start", (_event, ctx) => prepareSession(ctx));
 	pi.on("session_switch", (_event, ctx) => prepareSession(ctx));
 	pi.on("session_branch", (_event, ctx) => prepareSession(ctx));
@@ -316,13 +436,14 @@ export default function adaptiveProviderQueue(pi: ExtensionAPI): void {
 					? async () => (await aiInputCredential).resolvedKey
 					: undefined,
 				maxRetries: 50,
+				forwardQuotaToFallback: isQuotaFallbackProvider(model.provider),
 				rotateEndpointOnError: error =>
 					isAdaptiveTransientTransport(error) || isAdaptiveTransientUpstream(error),
 				endpointPoolSize: model.provider === AIINPUT_PROVIDER ? AIINPUT_ENDPOINTS.length : undefined,
 				...streamOptions(options),
 				createOutputStream: () => createAssistantMessageEventStream(),
 				createInputStream: async (attemptSignal, attempt) => {
-					const restoredModel = universalRetry.restoreOriginalModel(model);
+					const restoredModel = modelForProviderRequest(universalRetry.restoreOriginalModel(model));
 					const credential = await aiInputCredential;
 					const routePolicy = providerRequestAiInputRoutePolicy(sessionPolicies, {
 						sessionId: options?.sessionId,
