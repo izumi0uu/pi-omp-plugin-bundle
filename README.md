@@ -8,6 +8,8 @@ pi-omp-plugin-bundle/
 └── omp/                        # OMP 原生插件
     ├── adaptive-provider-queue/
     ├── pi-tool-display/
+    ├── omp-task-provider-handoff/
+    ├── omp-copy-turn/
     └── perplexity-role/
 ```
 
@@ -18,6 +20,8 @@ pi-omp-plugin-bundle/
 | OMP 17.3.5 | `adaptive-provider-queue` | Universal retry plus AI Input latency/jitter endpoint routing; locally verified |
 | OMP 17.2.x | `omp-pi-tool-display` | Ported from upstream `v0.5.0`; pure tests and isolated OMP 17.2.4 load verified |
 | OMP Role | `perplexity` | Dedicated main-agent window using Perplexity-first `web_search` |
+| OMP Extension | `omp-task-provider-handoff` | Mid-run replacement coordinator for provider-bound task agents |
+| OMP Extension | `omp-copy-turn` | Copy the latest human question and final answer as one Markdown block |
 | Pi | - | Reserved for native Pi ports |
 
 ## 开发与验证
@@ -62,6 +66,10 @@ omp plugin install github:izumi0uu/pi-omp-plugin-bundle#COMMIT_OR_TAG
 ```
 
 同一个插件也不要同时从手工 Extension 目录和 Plugin Manager 加载，否则会重复注册 transport、命令或工具。`adaptive-provider-queue` 会透明包装所有普通 OMP 模型请求；roles 和 fallback chains 继续使用原始 provider 名称，不再配置任何 `*-queued` selector。AI Input 只保留一个 provider，由插件在三个白名单 URL 间按延迟和抖动选择。具体配置见 [`omp/adaptive-provider-queue/README.md`](omp/adaptive-provider-queue/README.md)、[`omp/adaptive-provider-queue/RETRY-STRATEGY.md`](omp/adaptive-provider-queue/RETRY-STRATEGY.md) 和 [`omp/pi-tool-display/README.md`](omp/pi-tool-display/README.md)。
+
+`omp-task-provider-handoff` 用于运行中的 task agent 换到另一个 provider-bound profile。OMP 18 没有公开的 child 原地换 provider API，所以插件执行的是可审计的替换流程：交接请求 -> `hub` 等待回复 -> 取消旧 child -> `task` 创建新 child，并显式传入 `history://<旧 id>` 和 handoff。使用 `/task-replace <source-agent-id> <target-agent-profile> [reason]`，或让主 Agent 调用 `task_provider_handoff`。这不是 retry/fallback：只有新 child 创建并返回真实结果才算切换完成。
+
+`omp-copy-turn` 在一轮回答结束后显示复制操作条。按 `Ctrl+X`、`F6` 或执行 `/copy-turn`，会复制最近一轮人类问题和最终 assistant 文本；thinking、工具调用、工具结果和自动 continuation 不会混入。详见 [`omp/omp-copy-turn/README.md`](omp/omp-copy-turn/README.md)。
 
 `perplexity` 是窗口专用的 model role，不是插件或 task agent。安装配置和启动器后直接打开搜索窗口：
 

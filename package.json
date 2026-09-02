@@ -31,12 +31,14 @@
   "omp": {
     "extensions": [
       "./omp/adaptive-provider-queue/src/index.ts",
-      "./omp/pi-tool-display/index.ts"
+      "./omp/pi-tool-display/index.ts",
+      "./omp/omp-task-provider-handoff/src/index.ts",
+      "./omp/omp-copy-turn/src/index.ts"
     ]
   },
   "scripts": {
-    "test": "npm --prefix omp/adaptive-provider-queue test && npm --prefix omp/pi-tool-display test",
-    "pack:check": "npm --prefix omp/adaptive-provider-queue run pack:check && npm --prefix omp/pi-tool-display run pack:check",
+    "test": "npm --prefix omp/adaptive-provider-queue test && npm --prefix omp/pi-tool-display test && npm --prefix omp/omp-task-provider-handoff test && npm --prefix omp/omp-copy-turn test",
+    "pack:check": "npm --prefix omp/adaptive-provider-queue run pack:check && npm --prefix omp/pi-tool-display run pack:check && npm --prefix omp/omp-task-provider-handoff run pack:check && npm --prefix omp/omp-copy-turn run pack:check",
     "bundle:pack:check": "node omp/adaptive-provider-queue/scripts/pack-check.mjs",
     "check": "npm run test && npm run pack:check && npm run bundle:pack:check"
   },

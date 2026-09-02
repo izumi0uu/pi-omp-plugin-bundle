@@ -326,6 +326,15 @@ function replayUnsafeContentExists(message: AssistantLike | undefined): boolean 
 	});
 }
 
+function replayUnsafeNonTextContentExists(message: AssistantLike | undefined): boolean {
+	const content = message?.content;
+	if (!Array.isArray(content)) return false;
+	return content.some(block => {
+		if (!block || typeof block !== "object") return false;
+		return (block as Record<string, unknown>).type === "image";
+	});
+}
+
 function isReplaySafeBoundary(event: StreamEventLike): boolean {
 	if (event.type === "start" || event.type === "text_start" || event.type === "thinking_start") return true;
 	if (event.type === "text_delta" || event.type === "thinking_delta") return String(event.delta ?? "").length === 0;
@@ -657,6 +666,7 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 				let deferringToolCall = false;
 				let replayUnsafe = false;
 				let hasSubstantiveOutput = false;
+				let hasNonTextSubstantiveOutput = false;
 				let retry = false;
 				const pushEvent = (event: StreamEventLike) => {
 					if (event.type === "start") {
@@ -973,11 +983,17 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 
 						const cancelled = event.type === "error" && isCancellation(event.error, signal);
 						const kind = retryKind(event.error);
+						const canRetryInterruptedDeferredToolCall =
+							event.type === "error" &&
+							kind === "transport" &&
+							deferringToolCall &&
+							!hasNonTextSubstantiveOutput &&
+							!replayUnsafeNonTextContentExists(event.error);
 						if (
 							event.type === "error" &&
 							!cancelled &&
-							!hasSubstantiveOutput &&
-							!replayUnsafeContentExists(event.error) &&
+							(!hasSubstantiveOutput || canRetryInterruptedDeferredToolCall) &&
+							(!replayUnsafeContentExists(event.error) || canRetryInterruptedDeferredToolCall) &&
 							kind !== undefined
 						) {
 							excludeAttemptEndpoint(event.error);
@@ -1035,6 +1051,8 @@ export function createAdaptiveStream<TOutput extends OutputStreamLike>(options: 
 						replayUnsafe = event.type !== "error";
 						const eventHasSubstantiveOutput = isSubstantiveOutputEvent(event);
 						hasSubstantiveOutput ||= eventHasSubstantiveOutput;
+						hasNonTextSubstantiveOutput ||=
+							eventHasSubstantiveOutput && event.type !== "text_delta" && event.type !== "text_end";
 						if (eventHasSubstantiveOutput || replayUnsafeContentExists(event.error)) {
 							disableAttemptDeadline();
 							await clearObservedRetryState();

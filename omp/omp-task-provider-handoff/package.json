@@ -1,0 +1,42 @@
+{
+  "name": "omp-task-provider-handoff",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Safe mid-run provider replacement coordinator for OMP task agents",
+  "type": "module",
+  "files": [
+    "src",
+    "test",
+    "README.md",
+    "package.json"
+  ],
+  "keywords": [
+    "omp-plugin",
+    "oh-my-pi",
+    "subagent",
+    "handoff",
+    "provider"
+  ],
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "pack:check": "node ../adaptive-provider-queue/scripts/pack-check.mjs"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/izumi0uu/pi-omp-plugin-bundle.git",
+    "directory": "omp/omp-task-provider-handoff"
+  },
+  "homepage": "https://github.com/izumi0uu/pi-omp-plugin-bundle/tree/main/omp/omp-task-provider-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/izumi0uu/pi-omp-plugin-bundle/issues"
+  }
+}

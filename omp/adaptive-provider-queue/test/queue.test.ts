@@ -2526,22 +2526,31 @@ test("stream wrapper retries a transport drop after buffering an unexecuted tool
 		errorMessage: "The socket connection was closed unexpectedly",
 		content: [
 			{ type: "thinking", thinking: "delegate" },
+			{ type: "text", text: "I will delegate this work." },
 			{ type: "toolCall", id: "failed-task", name: "task", arguments: { prompt: "research" } },
 		],
 	});
-	const succeeded = assistant({ stopReason: "stop", content: [{ type: "text", text: "recovered" }] });
+	const succeeded = assistant({
+		stopReason: "toolUse",
+		content: [{ type: "toolCall", id: "recovered-task", name: "task", arguments: { prompt: "research" } }],
+	});
 	const attempts = [
 		new FakeInputStream([
 			{ type: "start", partial: assistant() },
-			{ type: "toolcall_start", contentIndex: 1, id: "failed-task", name: "task", partial: failed },
-			{ type: "toolcall_delta", contentIndex: 1, delta: '{"prompt":"research"}', partial: failed },
-			{ type: "toolcall_end", contentIndex: 1, partial: failed },
+			{ type: "text_start", contentIndex: 1, partial: failed },
+			{ type: "text_delta", contentIndex: 1, delta: "I will delegate this work.", partial: failed },
+			{ type: "text_end", contentIndex: 1, content: "I will delegate this work.", partial: failed },
+			{ type: "toolcall_start", contentIndex: 2, id: "failed-task", name: "task", partial: failed },
+			{ type: "toolcall_delta", contentIndex: 2, delta: '{"prompt":"research"}', partial: failed },
+			{ type: "toolcall_end", contentIndex: 2, partial: failed },
 			{ type: "error", reason: "error", error: failed },
 		]),
 		new FakeInputStream([
 			{ type: "start", partial: succeeded },
-			{ type: "text_delta", contentIndex: 0, delta: "recovered", partial: succeeded },
-			{ type: "done", reason: "stop", message: succeeded },
+			{ type: "toolcall_start", contentIndex: 0, id: "recovered-task", name: "task", partial: succeeded },
+			{ type: "toolcall_delta", contentIndex: 0, delta: '{"prompt":"research"}', partial: succeeded },
+			{ type: "toolcall_end", contentIndex: 0, partial: succeeded },
+			{ type: "done", reason: "toolUse", message: succeeded },
 		]),
 	];
 	const output = createAdaptiveStream({
@@ -2555,8 +2564,18 @@ test("stream wrapper retries a transport drop after buffering an unexecuted tool
 
 	await output.completion.promise;
 	assert.equal(attempts.length, 0);
-	assert.deepEqual(output.events.map(event => event.type), ["start", "text_delta", "done"]);
+	assert.deepEqual(output.events.map(event => event.type), [
+		"start",
+		"text_start",
+		"text_delta",
+		"text_end",
+		"toolcall_start",
+		"toolcall_delta",
+		"toolcall_end",
+		"done",
+	]);
 	assert.equal(output.events.some(event => event.id === "failed-task"), false);
+	assert.equal(output.events.some(event => event.id === "recovered-task"), true);
 });
 
 test("stream wrapper commits buffered tool calls only when the provider stream completes", async () => {
